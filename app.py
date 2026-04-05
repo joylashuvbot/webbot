@@ -52,10 +52,8 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        await conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_places_category ON places(category);
-            CREATE INDEX IF NOT EXISTS idx_places_coords ON places(latitude, longitude);
-        """)
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_places_category ON places(category)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_places_coords ON places(latitude, longitude)")
 
 async def close_db():
     if db_pool:
