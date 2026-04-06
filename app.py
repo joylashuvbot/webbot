@@ -34,9 +34,12 @@ async def init_db():
     global db_pool
     db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
     async with db_pool.acquire() as conn:
-        # 1. Jadval yaratish (agar yo'q bo'lsa)
+        # 1. ESKI JADVALNI O'CHIRISH (to'liq tozalash)
+        await conn.execute("DROP TABLE IF EXISTS places CASCADE")
+        
+        # 2. YANGI JADVAL YARATISH (to'liq struktura)
         await conn.execute("""
-            CREATE TABLE IF NOT EXISTS places (
+            CREATE TABLE places (
                 id SERIAL PRIMARY KEY,
                 name TEXT NOT NULL,
                 description TEXT,
@@ -54,40 +57,11 @@ async def init_db():
             )
         """)
         
-        # 2. YO'Q BO'LGAN ustunlarni qo'shish (muammo shu yerda!)
-        await conn.execute("""
-            DO $$ 
-            BEGIN
-                IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
-                              WHERE table_name='places' AND column_name='category') THEN
-                    ALTER TABLE places ADD COLUMN category TEXT CHECK (category IN ('food', 'service'));
-                END IF;
-                
-                IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
-                              WHERE table_name='places' AND column_name='delivery') THEN
-                    ALTER TABLE places ADD COLUMN delivery BOOLEAN DEFAULT FALSE;
-                END IF;
-                
-                IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
-                              WHERE table_name='places' AND column_name='menu_url') THEN
-                    ALTER TABLE places ADD COLUMN menu_url TEXT;
-                END IF;
-                
-                IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
-                              WHERE table_name='places' AND column_name='work_time') THEN
-                    ALTER TABLE places ADD COLUMN work_time TEXT;
-                END IF;
-                
-                IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
-                              WHERE table_name='places' AND column_name='telegram') THEN
-                    ALTER TABLE places ADD COLUMN telegram TEXT;
-                END IF;
-            END $$;
-        """)
+        # 3. INDEKSLAR
+        await conn.execute("CREATE INDEX idx_places_category ON places(category)")
+        await conn.execute("CREATE INDEX idx_places_coords ON places(latitude, longitude)")
         
-        # 3. Indekslar
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_places_category ON places(category)")
-        await conn.execute("CREATE INDEX IF NOT EXISTS idx_places_coords ON places(latitude, longitude)")
+        logger.info("✅ Database initialized successfully")
 
 async def close_db():
     if db_pool:
