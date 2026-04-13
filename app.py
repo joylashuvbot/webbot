@@ -34,34 +34,38 @@ async def init_db():
     global db_pool
     db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
     async with db_pool.acquire() as conn:
-        # 1. ESKI JADVALNI O'CHIRISH (to'liq tozalash)
-        await conn.execute("DROP TABLE IF EXISTS places CASCADE")
+        # Jadval mavjud emasligini tekshiramiz
+        exists = await conn.fetchval(
+            "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'places')"
+        )
         
-        # 2. YANGI JADVAL YARATISH (to'liq struktura)
-        await conn.execute("""
-            CREATE TABLE places (
-                id SERIAL PRIMARY KEY,
-                name TEXT NOT NULL,
-                description TEXT,
-                category TEXT CHECK (category IN ('food', 'service')),
-                latitude DOUBLE PRECISION NOT NULL,
-                longitude DOUBLE PRECISION NOT NULL,
-                city TEXT,
-                address TEXT,
-                phone TEXT,
-                telegram TEXT,
-                menu_url TEXT,
-                work_time TEXT,
-                delivery BOOLEAN DEFAULT FALSE,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
-        # 3. INDEKSLAR
-        await conn.execute("CREATE INDEX idx_places_category ON places(category)")
-        await conn.execute("CREATE INDEX idx_places_coords ON places(latitude, longitude)")
-        
-        logger.info("✅ Database initialized successfully")
+        if not exists:
+            # Faqat jadval yo'q bo'lsa yaratamiz
+            await conn.execute("""
+                CREATE TABLE places (
+                    id SERIAL PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    description TEXT,
+                    category TEXT CHECK (category IN ('food', 'service')),
+                    latitude DOUBLE PRECISION NOT NULL,
+                    longitude DOUBLE PRECISION NOT NULL,
+                    city TEXT,
+                    address TEXT,
+                    phone TEXT,
+                    telegram TEXT,
+                    menu_url TEXT,
+                    work_time TEXT,
+                    delivery BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            await conn.execute("CREATE INDEX idx_places_category ON places(category)")
+            await conn.execute("CREATE INDEX idx_places_coords ON places(latitude, longitude)")
+            
+            logger.info("✅ Database initialized successfully")
+        else:
+            logger.info("✅ Database already exists")
 
 async def close_db():
     if db_pool:
