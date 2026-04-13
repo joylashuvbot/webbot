@@ -75,12 +75,20 @@ async def close_db():
 def validate_telegram_data(init_data: str, bot_token: str) -> Optional[dict]:
     """Telegram WebApp initData ni tekshirish"""
     try:
+        if not init_data:
+            logger.error("init_data is empty!")
+            return None
+            
         parsed_data = dict(parse_qsl(init_data))
         received_hash = parsed_data.pop('hash', None)
         
         if not received_hash:
+            logger.error("No hash in init_data")
             return None
             
+        # Debug uchun
+        logger.info(f"Validating data: {parsed_data.keys()}")
+        
         data_check_string = '\n'.join(
             f"{k}={v}" for k, v in sorted(parsed_data.items())
         )
@@ -98,9 +106,11 @@ def validate_telegram_data(init_data: str, bot_token: str) -> Optional[dict]:
         ).hexdigest()
         
         if calculated_hash != received_hash:
+            logger.error(f"Hash mismatch! Expected: {calculated_hash}, Got: {received_hash}")
             return None
             
         user = json.loads(parsed_data.get('user', '{}'))
+        logger.info(f"User validated: {user.get('id')}")
         return user
     except Exception as e:
         logger.error(f"Validation error: {e}")
