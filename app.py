@@ -19,9 +19,9 @@ load_dotenv()
 
 # ------------------- Konfiguratsiya -------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_IDS = set(int(i.strip()) for i in os.getenv("ADMIN_ID").split(","))
+ADMIN_IDS = set(int(i.strip()) for i in os.getenv("ADMIN_ID", "").split(",") if i.strip())
 DATABASE_URL = os.getenv("DATABASE_URL")
-WEBAPP_URL = os.getenv("WEBAPP_URL")
+WEBAPP_URL = os.getenv("WEBAPP_URL", "")
 BOT_WEBHOOK_HOST = os.getenv("BOT_WEBHOOK_HOST", "0.0.0.0")
 BOT_WEBHOOK_PORT = int(os.getenv("BOT_WEBHOOK_PORT", "8080"))
 
@@ -32,10 +32,35 @@ logger = logging.getLogger(__name__)
 db_pool: Optional[asyncpg.Pool] = None
 
 async def init_db():
-    """Bazaga ulanish (jadval allaqachon food bot tomonidan yaratilgan)"""
+    """Bazaga ulanish va jadval mavjudligini tekshirish"""
     global db_pool
-    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
-    logger.info("✅ Database connected (food bot bazasi)")
+    try:
+        db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+        async with db_pool.acquire() as conn:
+            # places jadvali mavjudligini tekshirish
+            exists = await conn.fetchval("""
+                SELECT COUNT(*) FROM information_schema.tables 
+                WHERE table_schema = 'public' AND table_name = 'places'
+            """)
+            if exists:
+                count = await conn.fetchval("SELECT COUNT(*) FROM places")
+                logger.info(f"✅ DB ulanish OK. 'places' jadvalida {count} ta joy bor.")
+            else:
+                logger.warning("⚠️ 'places' jadvali topilmadi, yaratilmoqda...")
+                await conn.execute("""
+                    CREATE TABLE IF NOT EXISTS places (
+                        id SERIAL PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        lat DOUBLE PRECISION,
+                        lng DOUBLE PRECISION,
+                        text_user TEXT,
+                        text_channel TEXT
+                    )
+                """)
+                logger.info("✅ 'places' jadvali yaratildi.")
+    except Exception as e:
+        logger.error(f"Database init error: {e}")
+        raise
 
 async def close_db():
     if db_pool:
@@ -64,9 +89,10 @@ def validate_telegram_data(init_data: str, bot_token: str) -> Optional[dict]:
 def parse_place_from_db(row) -> dict:
     """
     Food bot bazasidagi row ni WebApp formatiga o'tkazish.
-    text_user dan telefon, telegram, manzil, ish vaqti kabilarni ajratib oladi.
+    asyncpg.Record ni dict ga aylantirib olamiz, chunki Record'da .get() yo'q.
     """
-    text = row.get('text_user') or row.get('text_channel') or ''
+    r = dict(row)
+    text = r.get('text_user') or r.get('text_channel') or ''
     
     # Telefon raqamini ajratib olish
     phone_match = re.search(r'📞\s*([+\d\s–()-]+)', text)
@@ -82,22 +108,22 @@ def parse_place_from_db(row) -> dict:
     
     # Manzilni ajratib olish
     addr_match = re.search(r'📍\s*<a[^>]*>([^<]+)</a>', text)
-    address = addr_match.group(1) if addr_match else row['name']
+    address = addr_match.group(1) if addr_match else r.get('name', 'Unknown')
     
     # Ish vaqtini ajratib olish
     time_match = re.search(r'⏰\s*([^\n]+)', text)
     work_time = time_match.group(1).strip() if time_match else None
     
     # Yetkazib berish bormi?
-    delivery = any(word in text.lower() for word in ['доставка', 'yetkazib', 'delivery', 'доставка'])
+    delivery = any(word in text.lower() for word in ['доставка', 'yetkazib', 'delivery'])
     
     return {
-        "id": row['id'],
-        "name": row['name'],
+        "id": r.get('id'),
+        "name": r.get('name', 'Unknown'),
         "description": text[:300] if text else '',
         "category": "food",
-        "lat": row['lat'],
-        "lng": row['lng'],
+        "lat": r.get('lat'),
+        "lng": r.get('lng'),
         "city": address,
         "address": address,
         "phone": phone,
@@ -109,22 +135,24 @@ def parse_place_from_db(row) -> dict:
 
 # ------------------- API Handlers -------------------
 async def get_places(request: web.Request) -> web.Response:
-    """Barcha joylarni olish (food bot bazasidan)"""
+    """Barcha joylarni olish"""
     try:
-        category = request.query.get('category')
-        search = request.query.get('search', '').lower()
+        search = request.query.get('search', '')
         
         async with db_pool.acquire() as conn:
-            # Food bot bazasi: id, name, lat, lng, text_user, text_channel
-            query = "SELECT * FROM places WHERE 1=1"
+            params = []
+            conditions = ["1=1"]
             
+            # SQL Injection xavfsizligi uchun parameterized query
             if search:
-                query += f" AND LOWER(name) LIKE '%{search}%'"
+                conditions.append(f"LOWER(name) LIKE ${len(params)+1}")
+                params.append(f"%{search.lower()}%")
             
-            rows = await conn.fetch(query)
+            query = f"SELECT * FROM places WHERE {' AND '.join(conditions)}"
+            rows = await conn.fetch(query, *params)
             places = [parse_place_from_db(row) for row in rows]
             
-            logger.info(f"Loaded {len(places)} places from food bot database")
+            logger.info(f"Loaded {len(places)} places")
             return web.json_response({"success": True, "data": places})
     except Exception as e:
         logger.error(f"Get places error: {e}")
@@ -138,16 +166,20 @@ async def get_nearby(request: web.Request) -> web.Response:
         radius = float(request.query.get('radius', 50))  # km
         
         async with db_pool.acquire() as conn:
+            # HAVING without GROUP BY muammoli bo'lgani uchun subquery
             rows = await conn.fetch("""
-                SELECT *, (
-                    6371 * acos(
-                        cos(radians($1)) * cos(radians(lat)) *
-                        cos(radians(lng) - radians($2)) +
-                        sin(radians($1)) * sin(radians(lat))
-                    )
-                ) AS distance
-                FROM places
-                HAVING distance <= $3
+                SELECT * FROM (
+                    SELECT *, (
+                        6371 * acos(
+                            cos(radians($1)) * cos(radians(lat)) *
+                            cos(radians(lng) - radians($2)) +
+                            sin(radians($1)) * sin(radians(lat))
+                        )
+                    ) AS distance
+                    FROM places
+                    WHERE lat IS NOT NULL AND lng IS NOT NULL
+                ) sub
+                WHERE distance <= $3
                 ORDER BY distance
             """, lat, lng, radius)
             
@@ -186,10 +218,11 @@ async def validate_user(request: web.Request) -> web.Response:
             }
         })
     except Exception as e:
+        logger.error(f"Validate error: {e}")
         return web.json_response({"success": False, "error": str(e)}, status=500)
 
 async def create_place(request: web.Request) -> web.Response:
-    """Yangi joy qo'shish (faqat admin) — food bot formatida"""
+    """Yangi joy qo'shish (faqat admin)"""
     try:
         data = await request.json()
         init_data = data.get('init_data', '')
@@ -215,6 +248,7 @@ async def create_place(request: web.Request) -> web.Response:
             
             return web.json_response({"success": True, "id": row['id']})
     except Exception as e:
+        logger.error(f"Create place error: {e}")
         return web.json_response({"success": False, "error": str(e)}, status=500)
 
 async def update_place(request: web.Request) -> web.Response:
@@ -243,6 +277,7 @@ async def update_place(request: web.Request) -> web.Response:
             )
             return web.json_response({"success": True})
     except Exception as e:
+        logger.error(f"Update place error: {e}")
         return web.json_response({"success": False, "error": str(e)}, status=500)
 
 async def delete_place(request: web.Request) -> web.Response:
@@ -260,6 +295,7 @@ async def delete_place(request: web.Request) -> web.Response:
             await conn.execute("DELETE FROM places WHERE id = $1", place_id)
             return web.json_response({"success": True})
     except Exception as e:
+        logger.error(f"Delete place error: {e}")
         return web.json_response({"success": False, "error": str(e)}, status=500)
 
 # ------------------- CORS Middleware -------------------
@@ -324,6 +360,7 @@ async def main():
     
     logger.info(f"🚀 Server started on http://{BOT_WEBHOOK_HOST}:{BOT_WEBHOOK_PORT}")
     
+    import asyncio
     await asyncio.gather(
         site.start(),
         dp.start_polling(bot, skip_updates=True)
