@@ -35,18 +35,32 @@ async def init_db():
     """Bazaga ulanish va jadval mavjudligini tekshirish"""
     global db_pool
     try:
+        logger.info(f"🔗 Connecting to DB...")
+        logger.info(f"🔗 DATABASE_URL starts with: {DATABASE_URL[:30] if DATABASE_URL else 'EMPTY'}...")
+
         db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
         async with db_pool.acquire() as conn:
+            # Barcha jadvallarni ko'rish
+            tables = await conn.fetch("""
+                SELECT table_name FROM information_schema.tables 
+                WHERE table_schema = 'public'
+            """)
+            logger.info(f"📋 Available tables: {[t['table_name'] for t in tables]}")
+
             # places jadvali mavjudligini tekshirish
             exists = await conn.fetchval("""
                 SELECT COUNT(*) FROM information_schema.tables 
                 WHERE table_schema = 'public' AND table_name = 'places'
             """)
+
             if exists:
                 count = await conn.fetchval("SELECT COUNT(*) FROM places")
-                # NULL koordinatalar sonini tekshirish
                 null_count = await conn.fetchval("SELECT COUNT(*) FROM places WHERE lat IS NULL OR lng IS NULL")
-                logger.info(f"✅ DB ulanish OK. 'places' jadvalida {count} ta joy bor. NULL koordinatalar: {null_count}")
+                sample = await conn.fetch("SELECT id, name, lat, lng FROM places LIMIT 3")
+
+                logger.info(f"✅ DB ulanish OK. 'places' jadvalida {count} ta joy bor.")
+                logger.info(f"✅ NULL koordinatalar: {null_count}")
+                logger.info(f"✅ Sample: {[dict(s) for s in sample]}")
             else:
                 logger.warning("⚠️ 'places' jadvali topilmadi!")
     except Exception as e:
@@ -131,7 +145,7 @@ async def get_places(request: web.Request) -> web.Response:
 
         async with db_pool.acquire() as conn:
             params = []
-            conditions = ["lat IS NOT NULL", "lng IS NOT NULL"]  # NULL koordinatalarni chiqarib tashlash
+            conditions = ["lat IS NOT NULL", "lng IS NOT NULL"]
 
             if search:
                 conditions.append(f"LOWER(name) LIKE ${len(params)+1}")
@@ -141,7 +155,7 @@ async def get_places(request: web.Request) -> web.Response:
             rows = await conn.fetch(query, *params)
             places = [parse_place_from_db(row) for row in rows]
 
-            logger.info(f"✅ Loaded {len(places)} places from DB")
+            logger.info(f"✅ API /places: {len(places)} places returned")
             return web.json_response({"success": True, "data": places})
     except Exception as e:
         logger.error(f"Get places error: {e}")
@@ -152,7 +166,7 @@ async def get_nearby(request: web.Request) -> web.Response:
     try:
         lat = float(request.query.get('lat', 0))
         lng = float(request.query.get('lng', 0))
-        radius = float(request.query.get('radius', 50))  # km
+        radius = float(request.query.get('radius', 50))
 
         async with db_pool.acquire() as conn:
             rows = await conn.fetch("""
@@ -286,7 +300,7 @@ async def delete_place(request: web.Request) -> web.Response:
         logger.error(f"Delete place error: {e}")
         return web.json_response({"success": False, "error": str(e)}, status=500)
 
-# ------------------- DEBUG Endpoint -------------------
+# ------------------- DEBUG Endpoints -------------------
 async def debug_db(request: web.Request) -> web.Response:
     """Debug: bazadagi ma'lumotlar haqida umumiy ma'lumot"""
     try:
@@ -300,6 +314,19 @@ async def debug_db(request: web.Request) -> web.Response:
                 "total_places": total,
                 "null_coordinates": null_coords,
                 "sample": [dict(r) for r in sample]
+            })
+    except Exception as e:
+        return web.json_response({"success": False, "error": str(e)}, status=500)
+
+async def debug_raw_places(request: web.Request) -> web.Response:
+    """Debug: barcha joylarni cheklamasdan olish"""
+    try:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch("SELECT id, name, lat, lng FROM places ORDER BY id")
+            return web.json_response({
+                "success": True,
+                "count": len(rows),
+                "places": [dict(r) for r in rows]
             })
     except Exception as e:
         return web.json_response({"success": False, "error": str(e)}, status=500)
@@ -354,7 +381,8 @@ async def init_app():
     app.router.add_post('/api/places', create_place)
     app.router.add_put('/api/places/{id}', update_place)
     app.router.add_delete('/api/places/{id}', delete_place)
-    app.router.add_get('/api/debug/db', debug_db)  # Debug endpoint
+    app.router.add_get('/api/debug/db', debug_db)
+    app.router.add_get('/api/debug/raw', debug_raw_places)
 
     return app
 
