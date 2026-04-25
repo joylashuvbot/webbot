@@ -40,31 +40,34 @@ async def init_db():
 
         db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
         async with db_pool.acquire() as conn:
-            # 1. Places jadvalini yaratish (agar yo'q bo'lsa) - lat/lngsiz!
+            # 1. Places jadvalini yaratish (agar yo'q bo'lsa) - faqat id bilan
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS places (
-                    id SERIAL PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    text_user TEXT NOT NULL,
-                    text_channel TEXT NOT NULL
+                    id SERIAL PRIMARY KEY
                 )
             """)
             
-            # 2. Agar lat/lng ustunlari yo'q bo'lsa, qo'shish
+            # 2. Barcha kerakli ustunlarni tekshirish va qo'shish
             columns = await conn.fetch("""
                 SELECT column_name 
                 FROM information_schema.columns 
                 WHERE table_name = 'places' AND table_schema = 'public'
             """)
             existing_cols = {row['column_name'] for row in columns}
+            logger.info(f"📋 Mavjud ustunlar: {existing_cols}")
             
-            if 'lat' not in existing_cols:
-                logger.info("➕ Adding 'lat' column to places table...")
-                await conn.execute("ALTER TABLE places ADD COLUMN lat DOUBLE PRECISION")
+            required_columns = {
+                'name': 'TEXT NOT NULL DEFAULT \'\'',
+                'lat': 'DOUBLE PRECISION',
+                'lng': 'DOUBLE PRECISION',
+                'text_user': 'TEXT NOT NULL DEFAULT \'\'',
+                'text_channel': 'TEXT NOT NULL DEFAULT \'\'',
+            }
             
-            if 'lng' not in existing_cols:
-                logger.info("➕ Adding 'lng' column to places table...")
-                await conn.execute("ALTER TABLE places ADD COLUMN lng DOUBLE PRECISION")
+            for col_name, col_type in required_columns.items():
+                if col_name not in existing_cols:
+                    logger.info(f"➕ Adding '{col_name}' column to places table...")
+                    await conn.execute(f"ALTER TABLE places ADD COLUMN {col_name} {col_type}")
             
             # 3. Indexlarni xavfsiz yaratish
             await conn.execute("""
