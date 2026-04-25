@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 db_pool: Optional[asyncpg.Pool] = None
 
 async def init_db():
-    """Bazaga ulanish va jadvallarni yaratish"""
+    """Bazaga ulanish va jadvallarni yaratish (yoki yangilash)"""
     global db_pool
     try:
         logger.info(f"🔗 Connecting to DB...")
@@ -40,28 +40,56 @@ async def init_db():
 
         db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
         async with db_pool.acquire() as conn:
-            # Places jadvalini yaratish
+            # 1. Places jadvalini yaratish (agar yo'q bo'lsa) - lat/lngsiz!
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS places (
                     id SERIAL PRIMARY KEY,
                     name TEXT NOT NULL,
-                    lat DOUBLE PRECISION,
-                    lng DOUBLE PRECISION,
                     text_user TEXT NOT NULL,
                     text_channel TEXT NOT NULL
                 )
             """)
-
-            # Indexlar
-            await conn.execute("""
-                CREATE INDEX IF NOT EXISTS idx_places_coords ON places(lat, lng);
-                CREATE INDEX IF NOT EXISTS idx_places_name ON places(name);
+            
+            # 2. Agar lat/lng ustunlari yo'q bo'lsa, qo'shish
+            columns = await conn.fetch("""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name = 'places' AND table_schema = 'public'
             """)
-
-            # Bazada ma'lumot borligini tekshirish
+            existing_cols = {row['column_name'] for row in columns}
+            
+            if 'lat' not in existing_cols:
+                logger.info("➕ Adding 'lat' column to places table...")
+                await conn.execute("ALTER TABLE places ADD COLUMN lat DOUBLE PRECISION")
+            
+            if 'lng' not in existing_cols:
+                logger.info("➕ Adding 'lng' column to places table...")
+                await conn.execute("ALTER TABLE places ADD COLUMN lng DOUBLE PRECISION")
+            
+            # 3. Indexlarni xavfsiz yaratish
+            await conn.execute("""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_indexes 
+                        WHERE indexname = 'idx_places_name'
+                    ) THEN
+                        CREATE INDEX idx_places_name ON places(name);
+                    END IF;
+                    
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_indexes 
+                        WHERE indexname = 'idx_places_coords'
+                    ) THEN
+                        CREATE INDEX idx_places_coords ON places(lat, lng);
+                    END IF;
+                END $$;
+            """)
+            
+            # 4. Bazada ma'lumot borligini tekshirish
             count = await conn.fetchval("SELECT COUNT(*) FROM places")
             logger.info(f"✅ DB ulanish OK. 'places' jadvalida {count} ta joy bor.")
-
+            
             if count == 0:
                 logger.info("📥 Baza bo'sh. Initial restoranlarni qo'shish...")
                 await load_initial_places(conn)
@@ -72,7 +100,7 @@ async def init_db():
                 with_coords = await conn.fetchval("SELECT COUNT(*) FROM places WHERE lat IS NOT NULL AND lng IS NOT NULL")
                 logger.info(f"✅ Koordinatasiz joylar: {null_count}")
                 logger.info(f"✅ Koordinatali joylar: {with_coords}")
-
+                
     except Exception as e:
         logger.error(f"Database init error: {e}")
         raise
