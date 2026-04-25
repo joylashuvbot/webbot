@@ -69,6 +69,14 @@ async def init_db():
                     logger.info(f"➕ Adding '{col_name}' column to places table...")
                     await conn.execute(f"ALTER TABLE places ADD COLUMN {col_name} {col_type}")
             
+            # 2.5. Avvalgi versiyadan qolgan latitude/longitude ustunlarini tekshirish
+            if 'latitude' in existing_cols:
+                logger.info("🔧 'latitude' ustuni NOT NULL emas qilinishyapti...")
+                await conn.execute("ALTER TABLE places ALTER COLUMN latitude DROP NOT NULL")
+            if 'longitude' in existing_cols:
+                logger.info("🔧 'longitude' ustuni NOT NULL emas qilinishyapti...")
+                await conn.execute("ALTER TABLE places ALTER COLUMN longitude DROP NOT NULL")
+            
             # 3. Indexlarni xavfsiz yaratish
             await conn.execute("""
                 DO $$
