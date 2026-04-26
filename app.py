@@ -6,7 +6,7 @@ import logging
 import re
 from typing import Optional, Dict, Any, List
 from urllib.parse import parse_qsl
-
+import asyncio
 import asyncpg
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
@@ -117,12 +117,31 @@ async def init_db():
         raise
 
 async def load_initial_places(conn):
-    """Baza bo'sh bo'lsa, initial restoranlarni qo'shish"""
+    """Baza bo'sh bo'lsa, initial restoranlarni qo'shish va koordinatalarini avto-topish"""
     for place in INITIAL_PLACES:
+        lat = place.get("lat")
+        lng = place.get("lng")
+        
+        # Agar koordinata yo'q bo'lsa, manzilni geocode qilishga urinish
+        if lat is None or lng is None:
+            text = place.get("text_user") or place.get("text_channel") or ""
+            addr_match = re.search(r'📍\s*([^\n]+)', text)
+            address = addr_match.group(1).strip() if addr_match else place["name"]
+            
+            coords = await geocode_address(address)
+            if coords:
+                lat, lng = coords
+                logger.info(f"📍 Auto-geocoded '{place['name']}' -> {lat}, {lng}")
+            else:
+                logger.warning(f"❌ Failed to geocode '{place['name']}'")
+            
+            # Nominatim: 1 soniyada 1 ta so'rov (rate limit)
+            await asyncio.sleep(1.1)
+        
         await conn.execute("""
             INSERT INTO places (name, lat, lng, text_user, text_channel)
             VALUES ($1, $2, $3, $4, $5)
-        """, place["name"], place.get("lat"), place.get("lng"), 
+        """, place["name"], lat, lng, 
             place["text_user"], place["text_channel"])
 
 async def close_db():
@@ -2299,12 +2318,23 @@ def validate_telegram_data(init_data: str, bot_token: str) -> Optional[dict]:
         return None
 
 # ------------------- Geocoding -------------------
+
 async def geocode_address(address: str) -> Optional[tuple]:
     """OpenStreetMap Nominatim orqali manzilni koordinataga o'girish"""
     import aiohttp
+    
+    # Manzildan URL, emoji va ortiqcha belgilarni tozalash
+    clean = re.sub(r'https?://\S+', '', address)
+    clean = re.sub(r'[📍🍽️🏠🏬🚛🏪📞📱⏰🚘📋🧾❌❗️🅿️🌐—()]', '', clean)
+    clean = clean.strip()
+    
+    if len(clean) < 3:
+        # Agar manzil bo'sh bo'lsa, faqat shahar nomini qidirishga urinish
+        clean = address.strip()[:50]
+    
     try:
         url = "https://nominatim.openstreetmap.org/search"
-        params = {"q": address, "format": "json", "limit": 1}
+        params = {"q": clean, "format": "json", "limit": 1}
         headers = {"User-Agent": "MyFoodMap/1.0"}
 
         async with aiohttp.ClientSession() as session:
@@ -2314,7 +2344,7 @@ async def geocode_address(address: str) -> Optional[tuple]:
                     if data and len(data) > 0:
                         return float(data[0]["lat"]), float(data[0]["lon"])
     except Exception as e:
-        logger.error(f"Geocoding error for '{address}': {e}")
+        logger.error(f"Geocoding error for '{clean}': {e}")
     return None
 
 def parse_place_from_db(row) -> dict:
