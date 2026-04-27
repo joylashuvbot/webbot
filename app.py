@@ -40,7 +40,7 @@ async def init_db():
 
         db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
         async with db_pool.acquire() as conn:
-            # 1. Places jadvalini yaratish (agar yo'q bo'lsa) - faqat id bilan
+            # 1. Places jadvalini yaratish (agar yo'q bo'lsa)
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS places (
                     id SERIAL PRIMARY KEY
@@ -56,26 +56,19 @@ async def init_db():
             existing_cols = {row['column_name'] for row in columns}
             logger.info(f"📋 Mavjud ustunlar: {existing_cols}")
 
+            # MUAMMO SHU YERDA EDI - string ichidagi apostrof
             required_columns = {
                 'name': "TEXT NOT NULL DEFAULT ''",
                 'lat': 'DOUBLE PRECISION',
                 'lng': 'DOUBLE PRECISION',
-                'text_user': "TEXT NOT NULL DEFAULT ''",
-                'text_channel': "TEXT NOT NULL DEFAULT ''",
+                'text_user': "TEXT NOT NULL DEFAULT ''",      # " ichida ' to'g'ri
+                'text_channel': "TEXT NOT NULL DEFAULT ''",   # " ichida ' to'g'ri
             }
 
             for col_name, col_type in required_columns.items():
                 if col_name not in existing_cols:
                     logger.info(f"➕ Adding '{col_name}' column to places table...")
                     await conn.execute(f"ALTER TABLE places ADD COLUMN {col_name} {col_type}")
-
-            # 2.5. Avvalgi versiyadan qolgan latitude/longitude ustunlarini tekshirish
-            if 'latitude' in existing_cols:
-                logger.info("🔧 'latitude' ustuni NOT NULL emas qilinishyapti...")
-                await conn.execute("ALTER TABLE places ALTER COLUMN latitude DROP NOT NULL")
-            if 'longitude' in existing_cols:
-                logger.info("🔧 'longitude' ustuni NOT NULL emas qilinishyapti...")
-                await conn.execute("ALTER TABLE places ALTER COLUMN longitude DROP NOT NULL")
 
             # 3. Indexlarni xavfsiz yaratish
             await conn.execute("""
@@ -2748,6 +2741,28 @@ async def cmd_start(message: types.Message):
 
     await message.answer(text, reply_markup=markup)
 
+async def health_check(request: web.Request) -> web.Response:
+    """Tekshirish: baza ulanishi va jadval holati"""
+    try:
+        async with db_pool.acquire() as conn:
+            cols = await conn.fetch("""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name = 'places'
+            """)
+            count = await conn.fetchval("SELECT COUNT(*) FROM places")
+            return web.json_response({
+                "success": True,
+                "db_connected": True,
+                "places_count": count,
+                "columns": [r['column_name'] for r in cols]
+            })
+    except Exception as e:
+        return web.json_response({
+            "success": False,
+            "error": str(e)
+        }, status=500)
+
 # ------------------- Main -------------------
 async def init_app():
     app = web.Application(middlewares=[cors_middleware])
@@ -2763,7 +2778,9 @@ async def init_app():
     app.router.add_delete('/api/places/{id}', delete_place)
     app.router.add_get('/api/debug/db', debug_db)
     app.router.add_get('/api/debug/raw', debug_raw_places)
+    app.router.add_get('/api/health', health_check)
 
+    
     return app
 
 async def main():
