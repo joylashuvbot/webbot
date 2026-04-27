@@ -2793,15 +2793,31 @@ async def cmd_start(message: types.Message):
     if is_admin:
         text += "\n\n👨‍💼 <b>Admin rejimi</b> faol."
 
-    web_app = types.WebAppInfo(url=WEBAPP_URL)
+    # Asosiy xarita va admin panel URL larini hosil qilish
+    web_app_url = WEBAPP_URL
+    if web_app_url.endswith('index.html'):
+        admin_url = web_app_url.replace('index.html', 'admin.html')
+    elif web_app_url.endswith('/'):
+        admin_url = web_app_url + 'admin.html'
+    else:
+        admin_url = web_app_url + '/admin.html'
 
-    markup = types.InlineKeyboardMarkup(inline_keyboard=[
-        [types.InlineKeyboardButton(
-            text="🗺 Xaritani ochish",
-            web_app=web_app
-        )]
-    ])
+    web_app = types.WebAppInfo(url=web_app_url)
+    admin_web_app = types.WebAppInfo(url=admin_url)
 
+    # Tugmalar: Admin uchun 2 ta, oddiy user uchun 1 ta
+    keyboard = []
+    if is_admin:
+        keyboard.append([types.InlineKeyboardButton(
+            text="👨‍💼 Admin Panel",
+            web_app=admin_web_app
+        )])
+    keyboard.append([types.InlineKeyboardButton(
+        text="🗺 Xaritani ochish",
+        web_app=web_app
+    )])
+
+    markup = types.InlineKeyboardMarkup(inline_keyboard=keyboard)
     await message.answer(text, reply_markup=markup)
 
 async def health_check(request: web.Request) -> web.Response:
