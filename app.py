@@ -4,6 +4,7 @@ import hmac
 import hashlib
 import logging
 import re
+import secrets
 from typing import Optional, Dict, Any, List
 from urllib.parse import parse_qsl
 import asyncio
@@ -24,37 +25,77 @@ DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:CCvagWGwtueLwCUy
 WEBAPP_URL = os.getenv("WEBAPP_URL", "")
 BOT_WEBHOOK_HOST = os.getenv("BOT_WEBHOOK_HOST", "0.0.0.0")
 BOT_WEBHOOK_PORT = int(os.getenv("BOT_WEBHOOK_PORT", "8080"))
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ------------------- Admin Token Storage -------------------
+admin_tokens = set()
+
+def generate_admin_token() -> str:
+    return secrets.token_urlsafe(32)
+
+async def check_admin_auth(data: dict) -> Optional[dict]:
+    """
+    Birlashtirilgan autentifikatsiya:
+    1. Admin token orqali (brauzer rejimi)
+    2. Telegram init_data orqali (WebApp rejimi)
+    """
+    init_data = data.get('init_data', '')
+    admin_token = data.get('admin_token', '')
+
+    if admin_token and admin_token in admin_tokens:
+        return {
+            "id": 0,
+            "first_name": "Admin",
+            "last_name": "",
+            "username": "admin",
+            "language_code": "uz",
+            "is_admin": True
+        }
+
+    if init_data:
+        user = validate_telegram_data(init_data, BOT_TOKEN)
+        if user:
+            user_id = user.get('id')
+            user['is_admin'] = user_id in ADMIN_IDS
+            return user
+
+    return None
 
 # ------------------- Database -------------------
 db_pool: Optional[asyncpg.Pool] = None
 
 async def init_db():
-    """Bazaga ulanish va jadvallarni yaratish (yoki yangilash)"""
+    """Bazaga ulanish va jadvallarni yaratish"""
     global db_pool
     try:
         logger.info(f"🔗 Connecting to DB...")
-        logger.info(f"🔗 DATABASE_URL starts with: {DATABASE_URL[:50]}...")
-
         db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
         async with db_pool.acquire() as conn:
-            # 1. Places jadvalini yaratish (agar yo'q bo'lsa)
+            # Places jadvali
             await conn.execute("""
-                CREATE TABLE IF NOT EXISTS places (
-                    id SERIAL PRIMARY KEY
+                CREATE TABLE IF NOT EXISTS places (id SERIAL PRIMARY KEY)
+            """)
+            
+            # Users jadvali (TIL SAQLASH UCHUN)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id BIGINT PRIMARY KEY,
+                    language TEXT NOT NULL DEFAULT 'uz',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
 
-            # 2. Barcha kerakli ustunlarni tekshirish va qo'shish
             columns = await conn.fetch("""
                 SELECT column_name 
                 FROM information_schema.columns 
                 WHERE table_name = 'places' AND table_schema = 'public'
             """)
             existing_cols = {row['column_name'] for row in columns}
-            logger.info(f"📋 Mavjud ustunlar: {existing_cols}")
+            logger.info(f"📋 Places ustunlari: {existing_cols}")
 
             required_columns = {
                 'name': "TEXT NOT NULL DEFAULT ''",
@@ -63,83 +104,76 @@ async def init_db():
                 'text_user': "TEXT NOT NULL DEFAULT ''",
                 'text_channel': "TEXT NOT NULL DEFAULT ''",
             }
-
             for col_name, col_type in required_columns.items():
                 if col_name not in existing_cols:
-                    logger.info(f"➕ Adding '{col_name}' column to places table...")
                     await conn.execute(f"ALTER TABLE places ADD COLUMN {col_name} {col_type}")
 
-            # 3. Indexlarni xavfsiz yaratish
             await conn.execute("""
                 DO $$
                 BEGIN
-                    IF NOT EXISTS (
-                        SELECT 1 FROM pg_indexes 
-                        WHERE indexname = 'idx_places_name'
-                    ) THEN
-                        CREATE INDEX idx_places_name ON places(name);
-                    END IF;
-
-                    IF NOT EXISTS (
-                        SELECT 1 FROM pg_indexes 
-                        WHERE indexname = 'idx_places_coords'
-                    ) THEN
-                        CREATE INDEX idx_places_coords ON places(lat, lng);
-                    END IF;
+                    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_places_name')
+                    THEN CREATE INDEX idx_places_name ON places(name); END IF;
+                    IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'idx_places_coords')
+                    THEN CREATE INDEX idx_places_coords ON places(lat, lng); END IF;
                 END $$;
             """)
 
-            # 4. Bazada ma'lumot borligini tekshirish
             count = await conn.fetchval("SELECT COUNT(*) FROM places")
-            logger.info(f"✅ DB ulanish OK. 'places' jadvalida {count} ta joy bor.")
-
+            logger.info(f"✅ DB OK. Places: {count} ta.")
             if count == 0:
-                logger.info("📥 Baza bo'sh. Initial restoranlarni qo'shish...")
                 await load_initial_places(conn)
-                count = await conn.fetchval("SELECT COUNT(*) FROM places")
-                logger.info(f"✅ Initial restoranlar qo'shildi. Jami: {count} ta.")
-            else:
-                null_count = await conn.fetchval("SELECT COUNT(*) FROM places WHERE lat IS NULL OR lng IS NULL")
-                with_coords = await conn.fetchval("SELECT COUNT(*) FROM places WHERE lat IS NOT NULL AND lng IS NOT NULL")
-                logger.info(f"✅ Koordinatasiz joylar: {null_count}")
-                logger.info(f"✅ Koordinatali joylar: {with_coords}")
 
     except Exception as e:
         logger.error(f"Database init error: {e}")
         raise
 
 async def load_initial_places(conn):
-    """Baza bo'sh bo'lsa, initial restoranlarni qo'shish va koordinatalarini avto-topish"""
     for place in INITIAL_PLACES:
-        lat = place.get("lat")
-        lng = place.get("lng")
-
-        # Agar koordinata yo'q bo'lsa, manzilni geocode qilishga urinish
+        lat, lng = place.get("lat"), place.get("lng")
         if lat is None or lng is None:
             text = place.get("text_user") or place.get("text_channel") or ""
             addr_match = re.search(r'📍\s*([^\n]+)', text)
             address = addr_match.group(1).strip() if addr_match else place["name"]
-
             coords = await geocode_address(address)
             if coords:
                 lat, lng = coords
-                logger.info(f"📍 Auto-geocoded '{place['name']}' -> {lat}, {lng}")
-            else:
-                logger.warning(f"❌ Failed to geocode '{place['name']}'")
-
-            # Nominatim: 1 soniyada 1 ta so'rov (rate limit)
             await asyncio.sleep(1.1)
-
         await conn.execute("""
             INSERT INTO places (name, lat, lng, text_user, text_channel)
             VALUES ($1, $2, $3, $4, $5)
-        """, place["name"], lat, lng, 
-            place["text_user"], place["text_channel"])
+        """, place["name"], lat, lng, place["text_user"], place["text_channel"])
 
 async def close_db():
     if db_pool:
         await db_pool.close()
 
+# ------------------- User Language Helpers -------------------
+async def get_user_language(user_id: int) -> str:
+    if db_pool is None:
+        return 'uz'
+    try:
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT language FROM users WHERE user_id = $1", user_id)
+            return row['language'] if row else 'uz'
+    except Exception as e:
+        logger.error(f"Get lang error: {e}")
+        return 'uz'
+
+async def set_user_language(user_id: int, language: str):
+    if db_pool is None:
+        return
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO users (user_id, language, updated_at)
+                VALUES ($1, $2, CURRENT_TIMESTAMP)
+                ON CONFLICT (user_id) 
+                DO UPDATE SET language = $2, updated_at = CURRENT_TIMESTAMP
+            """, user_id, language)
+    except Exception as e:
+        logger.error(f"Set lang error: {e}")
+
+# ------------------- Initial Places -------------------
 INITIAL_PLACES = [
     {
         "name": "ARZU CHICAGO",
@@ -2289,22 +2323,11 @@ INITIAL_PLACES = [
 
 # ------------------- Telegram InitData Validation -------------------
 def validate_telegram_data(init_data: str, bot_token: str) -> Optional[dict]:
-    """Telegram WebApp init_data ni tekshirish"""
     try:
         if not init_data:
             return None
-
-        # Demo rejim tekshiruvi - agar init_data demo_mode bilan boshlansa
         if init_data.startswith('demo_mode_'):
-            logger.info("🎮 Demo mode detected, skipping hash validation")
-            return {
-                "id": 0,
-                "first_name": "Demo",
-                "last_name": "User",
-                "username": "demo",
-                "language_code": "uz"
-            }
-
+            return {"id": 0, "first_name": "Demo", "last_name": "User", "username": "demo", "language_code": "uz"}
         parsed_data = dict(parse_qsl(init_data))
         received_hash = parsed_data.pop('hash', None)
         if not received_hash:
@@ -2321,246 +2344,203 @@ def validate_telegram_data(init_data: str, bot_token: str) -> Optional[dict]:
         return None
 
 # ------------------- Geocoding -------------------
-
 async def geocode_address(address: str) -> Optional[tuple]:
-    """OpenStreetMap Nominatim orqali manzilni koordinataga o'girish"""
     import aiohttp
-
-    # Manzildan URL, emoji va ortiqcha belgilarni tozalash
     clean = re.sub(r'https?://\S+', '', address)
-    clean = re.sub(r'[📍🍽️🏠🏬🚛🏪📞📱⏰🚘📋🧾❌❗️🅿️🌐—()]', '', clean)
-    clean = clean.strip()
-
+    clean = re.sub(r'[📍🍽️🏠🏬🚛🏪📞📱⏰🚘📋🧾❌❗️🅿️🌐—()]', '', clean).strip()
     if len(clean) < 3:
         clean = address.strip()[:50]
-
     try:
         url = "https://nominatim.openstreetmap.org/search"
         params = {"q": clean, "format": "json", "limit": 1}
         headers = {"User-Agent": "MyFoodMap/1.0"}
-
         async with aiohttp.ClientSession() as session:
             async with session.get(url, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    if data and len(data) > 0:
+                    if data:
                         return float(data[0]["lat"]), float(data[0]["lon"])
     except Exception as e:
-        logger.error(f"Geocoding error for '{clean}': {e}")
+        logger.error(f"Geocoding error: {e}")
     return None
 
 def parse_place_from_db(row) -> dict:
-    """
-    Food bot bazasidagi row ni WebApp formatiga o'tkazish.
-    """
     r = dict(row)
     text = r.get('text_user') or r.get('text_channel') or ''
 
-    # Telefon raqamini ajratib olish
     phone = None
-    phone_patterns = [
-        r'📞\s*Телефон:\s*([+\d\s\-\(\)–]+)',
-        r'📞\s*Telefon:\s*([+\d\s\-\(\)–]+)',
-        r'📞\s*([+\d\s\-\(\)–]+)',
-    ]
-    for pattern in phone_patterns:
+    for pattern in [r'📞\s*Телефон:\s*([+\d\s\-\(\)–]+)', r'📞\s*Telefon:\s*([+\d\s\-\(\)–]+)', r'📞\s*([+\d\s\-\(\)–]+)']:
         match = re.search(pattern, text)
         if match:
             phone = match.group(1).strip()
             break
 
-    # Telegramni ajratib olish
     tg_match = re.search(r'📱\s*(?:Telegram:\s*)?(@[\w\d_]+)', text)
     telegram = tg_match.group(1) if tg_match else None
 
-    # Menyu havolasini ajratib olish
     menu_url = None
-    menu_patterns = [
-        r'📋.*?\(?(https?://[^\s\)\n]+)',
-        r'📋\s*<a\s+href=["\']([^"\'\)\n]+)["\']',
-        r'(https?://[^\s\n]+(?:menu|menyu)[^\s\n]*)',
-    ]
-    for pattern in menu_patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            menu_url = match.group(1).strip().rstrip(')')
-            break
+    try:
+        for pattern in [
+            r'📋.*?\(?(https?://[^\s\)\n]+)',
+            r'📋\s*<a\s+href=["\']([^"\'\)\n]+)["\']',
+            r'(https?://[^\s\n]+(?:menu|menyu)[^\s\n]*)',
+        ]:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                menu_url = match.group(1).strip().rstrip(')')
+                break
+    except Exception:
+        pass
 
-    # Manzilni ajratib olish
     addr_match = re.search(r'📍\s*([^\n]+)', text)
     address = addr_match.group(1).strip() if addr_match else r.get('name', 'Unknown')
 
-    # Ish vaqtini ajratib olish
     time_match = re.search(r'⏰\s*([^\n]+)', text)
     work_time = time_match.group(1).strip() if time_match else None
 
-    # Yetkazib berish bormi?
-    delivery_keywords = ['доставка', 'yetkazib', 'delivery', 'доставка есть', 'yetkazib berish']
-    delivery = any(word in text.lower() for word in delivery_keywords)
+    delivery = any(w in text.lower() for w in ['доставка', 'yetkazib', 'delivery', 'доставка есть', 'yetkazib berish'])
 
     return {
-        "id": r.get('id'),
-        "name": r.get('name', 'Unknown'),
-        "description": text[:300] if text else '',
-        "category": "food",
-        "lat": r.get('lat'),
-        "lng": r.get('lng'),
-        "city": address,
-        "address": address,
-        "phone": phone,
-        "telegram": telegram,
-        "menu_url": menu_url,
-        "work_time": work_time,
-        "delivery": delivery
+        "id": r.get('id'), "name": r.get('name', 'Unknown'), "description": text[:300] if text else '',
+        "category": "food", "lat": r.get('lat'), "lng": r.get('lng'),
+        "city": address, "address": address, "phone": phone, "telegram": telegram,
+        "menu_url": menu_url, "work_time": work_time, "delivery": delivery
     }
 
 # ------------------- API Handlers -------------------
 async def get_places(request: web.Request) -> web.Response:
-    """Barcha joylarni olish — faqat to'liq koordinatali joylarni"""
     try:
         search = request.query.get('search', '')
-
-        # Check if db_pool is initialized
         if db_pool is None:
-            logger.error("❌ Database pool is not initialized!")
             return web.json_response({"success": False, "error": "Database not connected"}, status=500)
-
         async with db_pool.acquire() as conn:
-            params = []
-            conditions = ["lat IS NOT NULL", "lng IS NOT NULL"]
-
+            params, conditions = [], ["lat IS NOT NULL", "lng IS NOT NULL"]
             if search:
                 conditions.append(f"LOWER(name) LIKE ${len(params)+1}")
                 params.append(f"%{search.lower()}%")
-
-            query = f"SELECT * FROM places WHERE {' AND '.join(conditions)} ORDER BY id"
-            rows = await conn.fetch(query, *params)
-            places = [parse_place_from_db(row) for row in rows]
-
-            logger.info(f"✅ API /places: {len(places)} places returned")
-            return web.json_response({"success": True, "data": places})
+            rows = await conn.fetch(f"SELECT * FROM places WHERE {' AND '.join(conditions)} ORDER BY id", *params)
+            return web.json_response({"success": True, "data": [parse_place_from_db(r) for r in rows]})
     except Exception as e:
         logger.error(f"Get places error: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
         return web.json_response({"success": False, "error": str(e)}, status=500)
 
 async def get_all_places_list(request: web.Request) -> web.Response:
-    """Barcha joylarni ro'yxat ko'rinishida olish (koordinatasizlar ham)"""
     try:
         search = request.query.get('search', '')
-
         if db_pool is None:
             return web.json_response({"success": False, "error": "Database not connected"}, status=500)
-
         async with db_pool.acquire() as conn:
-            params = []
-            conditions = []
+            params, conditions = [], []
             if search:
                 conditions.append(f"LOWER(name) LIKE ${len(params)+1}")
                 params.append(f"%{search.lower()}%")
-
             where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
             rows = await conn.fetch(f"SELECT * FROM places {where_clause} ORDER BY id", *params)
-            places = [parse_place_from_db(row) for row in rows]
-            return web.json_response({"success": True, "data": places})
+            return web.json_response({"success": True, "data": [parse_place_from_db(r) for r in rows]})
     except Exception as e:
         logger.error(f"Get all places error: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
         return web.json_response({"success": False, "error": str(e)}, status=500)
 
 async def get_nearby(request: web.Request) -> web.Response:
-    """Yaqin atrofdagi joylarni olish"""
     try:
-        lat = float(request.query.get('lat', 0))
-        lng = float(request.query.get('lng', 0))
+        lat, lng = float(request.query.get('lat', 0)), float(request.query.get('lng', 0))
         radius = float(request.query.get('radius', 50))
-
         if db_pool is None:
             return web.json_response({"success": False, "error": "Database not connected"}, status=500)
-
         async with db_pool.acquire() as conn:
             rows = await conn.fetch("""
-                SELECT * FROM (
-                    SELECT *, (
-                        6371 * acos(
-                            cos(radians($1)) * cos(radians(lat)) *
-                            cos(radians(lng) - radians($2)) +
-                            sin(radians($1)) * sin(radians(lat))
-                        )
-                    ) AS distance
-                    FROM places
-                    WHERE lat IS NOT NULL AND lng IS NOT NULL
-                ) sub
-                WHERE distance <= $3
-                ORDER BY distance
+                SELECT *, (6371 * acos(cos(radians($1)) * cos(radians(lat)) * cos(radians(lng) - radians($2)) + sin(radians($1)) * sin(radians(lat)))) AS distance
+                FROM places WHERE lat IS NOT NULL AND lng IS NOT NULL
+                HAVING distance <= $3 ORDER BY distance
             """, lat, lng, radius)
-
             places = []
             for row in rows:
-                place = parse_place_from_db(row)
-                place["distance"] = round(row['distance'], 1)
-                places.append(place)
-
+                p = parse_place_from_db(row)
+                p["distance"] = round(row['distance'], 1)
+                places.append(p)
             return web.json_response({"success": True, "data": places})
     except Exception as e:
         logger.error(f"Get nearby error: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
+        return web.json_response({"success": False, "error": str(e)}, status=500)
+
+async def admin_login(request: web.Request) -> web.Response:
+    try:
+        data = await request.json()
+        password = data.get('password', '')
+        if not ADMIN_PASSWORD:
+            return web.json_response({"success": False, "error": "Admin password not configured"}, status=500)
+        if password != ADMIN_PASSWORD:
+            return web.json_response({"success": False, "error": "Invalid password"}, status=401)
+        token = generate_admin_token()
+        admin_tokens.add(token)
+        logger.info("🔐 Admin logged in via password")
+        return web.json_response({
+            "success": True, "token": token,
+            "user": {"id": 0, "name": "Admin", "username": "admin", "language": "uz", "is_admin": True}
+        })
+    except Exception as e:
+        logger.error(f"Admin login error: {e}")
         return web.json_response({"success": False, "error": str(e)}, status=500)
 
 async def validate_user(request: web.Request) -> web.Response:
-    """Foydalanuvchi ma'lumotlarini tekshirish"""
     try:
         data = await request.json()
-        init_data = data.get('init_data', '')
-
-        user = validate_telegram_data(init_data, BOT_TOKEN)
+        user = await check_admin_auth(data)
         if not user:
             return web.json_response({"success": False, "error": "Invalid data"}, status=403)
 
         user_id = user.get('id')
-        is_admin = user_id in ADMIN_IDS
+        db_lang = await get_user_language(user_id) if user_id else user.get('language_code', 'uz')
 
         return web.json_response({
             "success": True,
             "user": {
                 "id": user_id,
-                "name": f"{user.get('first_name', '')} {user.get('last_name', '')}".strip(),
+                "name": f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or user.get('username', 'User'),
                 "username": user.get('username'),
-                "language": user.get('language_code', 'en'),
-                "is_admin": is_admin
+                "language": db_lang,
+                "is_admin": user.get('is_admin', False)
             }
         })
     except Exception as e:
         logger.error(f"Validate error: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
+        return web.json_response({"success": False, "error": str(e)}, status=500)
+
+async def update_user_language(request: web.Request) -> web.Response:
+    """WebApp dan til o'zgarishini saqlash"""
+    try:
+        data = await request.json()
+        user = await check_admin_auth(data)
+        if not user:
+            return web.json_response({"success": False, "error": "Unauthorized"}, status=403)
+
+        user_id = user.get('id')
+        if not user_id:
+            return web.json_response({"success": False, "error": "Invalid user"}, status=400)
+
+        language = data.get('language', 'uz')
+        if language not in ('uz', 'ru', 'en'):
+            return web.json_response({"success": False, "error": "Invalid language"}, status=400)
+
+        await set_user_language(user_id, language)
+        return web.json_response({"success": True, "language": language})
+    except Exception as e:
+        logger.error(f"Update language error: {e}")
         return web.json_response({"success": False, "error": str(e)}, status=500)
 
 async def create_place(request: web.Request) -> web.Response:
-    """Yangi joy qo'shish (faqat admin)"""
     try:
         data = await request.json()
-        init_data = data.get('init_data', '')
-
-        user = validate_telegram_data(init_data, BOT_TOKEN)
-        if not user or user.get('id') not in ADMIN_IDS:
+        user = await check_admin_auth(data)
+        if not user or not user.get('is_admin'):
             return web.json_response({"success": False, "error": "Unauthorized"}, status=403)
 
         place = data.get('place', {})
-
-        # Agar koordinatalar berilmagan bo'lsa, manzilni geocode qilishga urinish
-        lat = place.get('lat')
-        lng = place.get('lng')
-        address = place.get('address', '')
-
+        lat, lng, address = place.get('lat'), place.get('lng'), place.get('address', '')
         if (not lat or not lng) and address:
             coords = await geocode_address(address)
             if coords:
                 lat, lng = coords
-                logger.info(f"📍 Geocoded '{address}' -> {lat}, {lng}")
 
         if db_pool is None:
             return web.json_response({"success": False, "error": "Database not connected"}, status=500)
@@ -2568,66 +2548,41 @@ async def create_place(request: web.Request) -> web.Response:
         async with db_pool.acquire() as conn:
             row = await conn.fetchrow("""
                 INSERT INTO places (name, lat, lng, text_user, text_channel)
-                VALUES ($1, $2, $3, $4, $5)
-                RETURNING id
-            """, 
-                place.get('name'),
-                lat,
-                lng,
-                place.get('text_user', ''),
-                place.get('text_channel', '')
-            )
-
+                VALUES ($1, $2, $3, $4, $5) RETURNING id
+            """, place.get('name'), lat, lng, place.get('text_user', ''), place.get('text_channel', ''))
             return web.json_response({"success": True, "id": row['id'], "lat": lat, "lng": lng})
     except Exception as e:
         logger.error(f"Create place error: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
         return web.json_response({"success": False, "error": str(e)}, status=500)
 
 async def update_place(request: web.Request) -> web.Response:
-    """Joyni yangilash"""
     try:
         place_id = int(request.match_info['id'])
         data = await request.json()
-        init_data = data.get('init_data', '')
-
-        user = validate_telegram_data(init_data, BOT_TOKEN)
-        if not user or user.get('id') not in ADMIN_IDS:
+        user = await check_admin_auth(data)
+        if not user or not user.get('is_admin'):
             return web.json_response({"success": False, "error": "Unauthorized"}, status=403)
 
         place = data.get('place', {})
-
         if db_pool is None:
             return web.json_response({"success": False, "error": "Database not connected"}, status=500)
 
         async with db_pool.acquire() as conn:
             await conn.execute("""
-                UPDATE places SET
-                    name = $1, lat = $2, lng = $3, 
-                    text_user = $4, text_channel = $5
-                WHERE id = $6
-            """,
-                place.get('name'), place.get('lat'), place.get('lng'),
-                place.get('text_user', ''), place.get('text_channel', ''),
-                place_id
-            )
+                UPDATE places SET name=$1, lat=$2, lng=$3, text_user=$4, text_channel=$5 WHERE id=$6
+            """, place.get('name'), place.get('lat'), place.get('lng'),
+                place.get('text_user', ''), place.get('text_channel', ''), place_id)
             return web.json_response({"success": True})
     except Exception as e:
         logger.error(f"Update place error: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
         return web.json_response({"success": False, "error": str(e)}, status=500)
 
 async def delete_place(request: web.Request) -> web.Response:
-    """Joyni o'chirish"""
     try:
         place_id = int(request.match_info['id'])
         data = await request.json()
-        init_data = data.get('init_data', '')
-
-        user = validate_telegram_data(init_data, BOT_TOKEN)
-        if not user or user.get('id') not in ADMIN_IDS:
+        user = await check_admin_auth(data)
+        if not user or not user.get('is_admin'):
             return web.json_response({"success": False, "error": "Unauthorized"}, status=403)
 
         if db_pool is None:
@@ -2638,19 +2593,14 @@ async def delete_place(request: web.Request) -> web.Response:
             return web.json_response({"success": True})
     except Exception as e:
         logger.error(f"Delete place error: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
         return web.json_response({"success": False, "error": str(e)}, status=500)
 
 async def geocode_place(request: web.Request) -> web.Response:
-    """Mavjud joyni manzili bo'yicha geocode qilish (admin)"""
     try:
         place_id = int(request.match_info['id'])
         data = await request.json()
-        init_data = data.get('init_data', '')
-
-        user = validate_telegram_data(init_data, BOT_TOKEN)
-        if not user or user.get('id') not in ADMIN_IDS:
+        user = await check_admin_auth(data)
+        if not user or not user.get('is_admin'):
             return web.json_response({"success": False, "error": "Unauthorized"}, status=403)
 
         if db_pool is None:
@@ -2669,22 +2619,16 @@ async def geocode_place(request: web.Request) -> web.Response:
             if coords:
                 await conn.execute("UPDATE places SET lat = $1, lng = $2 WHERE id = $3", coords[0], coords[1], place_id)
                 return web.json_response({"success": True, "lat": coords[0], "lng": coords[1]})
-            else:
-                return web.json_response({"success": False, "error": "Could not geocode address"})
+            return web.json_response({"success": False, "error": "Could not geocode address"})
     except Exception as e:
         logger.error(f"Geocode place error: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
         return web.json_response({"success": False, "error": str(e)}, status=500)
 
 async def geocode_all_places(request: web.Request) -> web.Response:
-    """Barcha koordinatasiz joylarni avtomatik geocode qilish (admin)"""
     try:
         data = await request.json()
-        init_data = data.get('init_data', '')
-
-        user = validate_telegram_data(init_data, BOT_TOKEN)
-        if not user or user.get('id') not in ADMIN_IDS:
+        user = await check_admin_auth(data)
+        if not user or not user.get('is_admin'):
             return web.json_response({"success": False, "error": "Unauthorized"}, status=403)
 
         if db_pool is None:
@@ -2692,76 +2636,47 @@ async def geocode_all_places(request: web.Request) -> web.Response:
 
         async with db_pool.acquire() as conn:
             rows = await conn.fetch("SELECT id, name, text_user, text_channel FROM places WHERE lat IS NULL OR lng IS NULL")
-
-            updated = 0
-            failed = 0
-
+            updated, failed = 0, 0
             for row in rows:
                 text = row['text_user'] or row['text_channel'] or ''
                 addr_match = re.search(r'📍\s*([^\n]+)', text)
                 address = addr_match.group(1).strip() if addr_match else row['name']
-
                 coords = await geocode_address(address)
                 if coords:
                     await conn.execute("UPDATE places SET lat = $1, lng = $2 WHERE id = $3", coords[0], coords[1], row['id'])
                     updated += 1
-                    logger.info(f"✅ Geocoded place {row['id']} '{row['name']}' -> {coords}")
                 else:
                     failed += 1
-                    logger.warning(f"❌ Failed to geocode place {row['id']} '{row['name']}' with address '{address}'")
-
-                # Nominatim rate limit: max 1 request per second
-                import asyncio
                 await asyncio.sleep(1.1)
-
             return web.json_response({"success": True, "updated": updated, "failed": failed})
     except Exception as e:
         logger.error(f"Geocode all error: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
         return web.json_response({"success": False, "error": str(e)}, status=500)
 
-# ------------------- DEBUG Endpoints -------------------
 async def debug_db(request: web.Request) -> web.Response:
-    """Debug: bazadagi ma'lumotlar haqida umumiy ma'lumot"""
     try:
         if db_pool is None:
             return web.json_response({"success": False, "error": "Database pool not initialized"}, status=500)
-
         async with db_pool.acquire() as conn:
             total = await conn.fetchval("SELECT COUNT(*) FROM places")
             null_coords = await conn.fetchval("SELECT COUNT(*) FROM places WHERE lat IS NULL OR lng IS NULL")
             with_coords = await conn.fetchval("SELECT COUNT(*) FROM places WHERE lat IS NOT NULL AND lng IS NOT NULL")
             sample = await conn.fetch("SELECT id, name, lat, lng, text_user FROM places LIMIT 5")
-
             return web.json_response({
-                "success": True,
-                "total_places": total,
-                "null_coordinates": null_coords,
-                "with_coordinates": with_coords,
-                "sample": [dict(r) for r in sample]
+                "success": True, "total_places": total, "null_coordinates": null_coords,
+                "with_coordinates": with_coords, "sample": [dict(r) for r in sample]
             })
     except Exception as e:
-        import traceback
-        logger.error(traceback.format_exc())
         return web.json_response({"success": False, "error": str(e)}, status=500)
 
 async def debug_raw_places(request: web.Request) -> web.Response:
-    """Debug: barcha joylarni cheklamasdan olish"""
     try:
         if db_pool is None:
             return web.json_response({"success": False, "error": "Database pool not initialized"}, status=500)
-
         async with db_pool.acquire() as conn:
             rows = await conn.fetch("SELECT id, name, lat, lng, text_user FROM places ORDER BY id")
-            return web.json_response({
-                "success": True,
-                "count": len(rows),
-                "places": [dict(r) for r in rows]
-            })
+            return web.json_response({"success": True, "count": len(rows), "places": [dict(r) for r in rows]})
     except Exception as e:
-        import traceback
-        logger.error(traceback.format_exc())
         return web.json_response({"success": False, "error": str(e)}, status=500)
 
 # ------------------- CORS Middleware -------------------
@@ -2773,7 +2688,6 @@ async def cors_middleware(request, handler):
             'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
             'Access-Control-Allow-Headers': 'Content-Type, Authorization',
         })
-
     response = await handler(request)
     response.headers['Access-Control-Allow-Origin'] = '*'
     response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
@@ -2784,16 +2698,33 @@ async def cors_middleware(request, handler):
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
-@dp.message(CommandStart())
-async def cmd_start(message: types.Message):
-    user_id = message.from_user.id
-    is_admin = user_id in ADMIN_IDS
-
-    text = "🗺 <b>My Food Map</b>\n\nXaritadan restoran va xizmatlarni toping!"
+async def show_main_menu(message: types.Message, user_id: int, lang: str, is_admin: bool):
+    """Asosiy menyuni tilga qarab ko'rsatish"""
+    texts = {
+        'uz': {
+            'welcome': "🗺 <b>My Food Map</b>\n\nXaritadan restoran va xizmatlarni toping!",
+            'admin': "\n\n👨‍💼 <b>Admin rejimi</b> faol.",
+            'map_btn': "🗺 Xaritani ochish",
+            'admin_btn': "👨‍💼 Admin Panel"
+        },
+        'ru': {
+            'welcome': "🗺 <b>My Food Map</b>\n\nНайдите рестораны и услуги на карте!",
+            'admin': "\n\n👨‍💼 <b>Режим администратора</b> активен.",
+            'map_btn': "🗺 Открыть карту",
+            'admin_btn': "👨‍💼 Админ панель"
+        },
+        'en': {
+            'welcome': "🗺 <b>My Food Map</b>\n\nFind restaurants and services on the map!",
+            'admin': "\n\n👨‍💼 <b>Admin mode</b> active.",
+            'map_btn': "🗺 Open Map",
+            'admin_btn': "👨‍💼 Admin Panel"
+        }
+    }
+    t = texts.get(lang, texts['uz'])
+    text = t['welcome']
     if is_admin:
-        text += "\n\n👨‍💼 <b>Admin rejimi</b> faol."
+        text += t['admin']
 
-    # Asosiy xarita va admin panel URL larini hosil qilish
     web_app_url = WEBAPP_URL
     if web_app_url.endswith('index.html'):
         admin_url = web_app_url.replace('index.html', 'admin.html')
@@ -2805,59 +2736,95 @@ async def cmd_start(message: types.Message):
     web_app = types.WebAppInfo(url=web_app_url)
     admin_web_app = types.WebAppInfo(url=admin_url)
 
-    # Tugmalar: Admin uchun 2 ta, oddiy user uchun 1 ta
     keyboard = []
     if is_admin:
-        keyboard.append([types.InlineKeyboardButton(
-            text="👨‍💼 Admin Panel",
-            web_app=admin_web_app
-        )])
-    keyboard.append([types.InlineKeyboardButton(
-        text="🗺 Xaritani ochish",
-        web_app=web_app
-    )])
+        keyboard.append([types.InlineKeyboardButton(text=t['admin_btn'], web_app=admin_web_app)])
+    keyboard.append([types.InlineKeyboardButton(text=t['map_btn'], web_app=web_app)])
 
     markup = types.InlineKeyboardMarkup(inline_keyboard=keyboard)
     await message.answer(text, reply_markup=markup)
 
+@dp.message(CommandStart())
+async def cmd_start(message: types.Message):
+    user_id = message.from_user.id
+    is_admin = user_id in ADMIN_IDS
+    
+    # Foydalanuvchi bazada bormi?
+    user_exists = False
+    if db_pool:
+        try:
+            async with db_pool.acquire() as conn:
+                row = await conn.fetchrow("SELECT 1 FROM users WHERE user_id = $1", user_id)
+                user_exists = row is not None
+        except Exception as e:
+            logger.error(f"Check user exists error: {e}")
+    
+    if not user_exists:
+        # TIL TANLASH (birinch marta)
+        tg_lang = message.from_user.language_code or 'uz'
+        prompts = {
+            'uz': "🌐 Tilni tanlang:",
+            'ru': "🌐 Выберите язык:",
+            'en': "🌐 Select language:"
+        }
+        prompt = prompts.get(tg_lang, prompts['uz'])
+        
+        markup = types.InlineKeyboardMarkup(inline_keyboard=[
+            [
+                types.InlineKeyboardButton(text="🇺🇿 O'zbekcha", callback_data="lang:uz"),
+                types.InlineKeyboardButton(text="🇷🇺 Русский", callback_data="lang:ru"),
+                types.InlineKeyboardButton(text="🇬🇧 English", callback_data="lang:en")
+            ]
+        ])
+        await message.answer(prompt, reply_markup=markup)
+        return
+    
+    # Saqlangan tilni olish va menyuni ko'rsatish
+    lang = await get_user_language(user_id)
+    await show_main_menu(message, user_id, lang, is_admin)
+
+@dp.callback_query(lambda c: c.data.startswith('lang:'))
+async def process_language(callback_query: types.CallbackQuery):
+    lang = callback_query.data.split(':')[1]
+    user_id = callback_query.from_user.id
+    is_admin = user_id in ADMIN_IDS
+    
+    await set_user_language(user_id, lang)
+    
+    answers = {
+        'uz': "✅ O'zbek tili tanlandi",
+        'ru': "✅ Выбран русский язык",
+        'en': "✅ English selected"
+    }
+    await callback_query.answer(answers.get(lang, answers['uz']))
+    await callback_query.message.delete()
+    
+    # Asosiy menyuni tanlangan tilda ko'rsatish
+    await show_main_menu(callback_query.message, user_id, lang, is_admin)
+
 async def health_check(request: web.Request) -> web.Response:
-    """Tekshirish: baza ulanishi va jadval holati"""
     try:
         if db_pool is None:
-            return web.json_response({
-                "success": False,
-                "error": "Database pool not initialized"
-            }, status=500)
-
+            return web.json_response({"success": False, "error": "Database pool not initialized"}, status=500)
         async with db_pool.acquire() as conn:
-            cols = await conn.fetch("""
-                SELECT column_name 
-                FROM information_schema.columns 
-                WHERE table_name = 'places'
-            """)
+            cols = await conn.fetch("SELECT column_name FROM information_schema.columns WHERE table_name = 'places'")
             count = await conn.fetchval("SELECT COUNT(*) FROM places")
             return web.json_response({
-                "success": True,
-                "db_connected": True,
-                "places_count": count,
+                "success": True, "db_connected": True, "places_count": count,
                 "columns": [r['column_name'] for r in cols]
             })
     except Exception as e:
-        import traceback
-        logger.error(traceback.format_exc())
-        return web.json_response({
-            "success": False,
-            "error": str(e)
-        }, status=500)
+        return web.json_response({"success": False, "error": str(e)}, status=500)
 
 # ------------------- Main -------------------
 async def init_app():
     app = web.Application(middlewares=[cors_middleware])
-
     app.router.add_get('/api/places', get_places)
     app.router.add_get('/api/places/all', get_all_places_list)
     app.router.add_get('/api/nearby', get_nearby)
     app.router.add_post('/api/validate', validate_user)
+    app.router.add_post('/api/admin/login', admin_login)
+    app.router.add_post('/api/user/language', update_user_language)  # TIL YANGILASH
     app.router.add_post('/api/places', create_place)
     app.router.add_post('/api/places/{id}/geocode', geocode_place)
     app.router.add_post('/api/admin/geocode-all', geocode_all_places)
@@ -2866,25 +2833,15 @@ async def init_app():
     app.router.add_get('/api/debug/db', debug_db)
     app.router.add_get('/api/debug/raw', debug_raw_places)
     app.router.add_get('/api/health', health_check)
-
-
     return app
 
 async def main():
     await init_db()
-
     runner = web.AppRunner(await init_app())
     await runner.setup()
     site = web.TCPSite(runner, BOT_WEBHOOK_HOST, BOT_WEBHOOK_PORT)
-
     logger.info(f"🚀 Server started on http://{BOT_WEBHOOK_HOST}:{BOT_WEBHOOK_PORT}")
-
-    import asyncio
-    await asyncio.gather(
-        site.start(),
-        dp.start_polling(bot, skip_updates=True)
-    )
+    await asyncio.gather(site.start(), dp.start_polling(bot, skip_updates=True))
 
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main())
