@@ -315,8 +315,8 @@ def parse_place_from_db(row) -> dict:
     menu_url = None
     menu_patterns = [
         r'📋.*?\(?(https?://[^\s\)\n]+)',
-        r'📋\s*<a\s+href=["\'][^"\'\)\n]+["\']',
-        r'https?://[^\s\n]+(?:menu|menyu)[^\s\n]*',
+        r'📋\s*<a\s+href=["\']([^"\'\)\n]+)["\']',
+        r'(https?://[^\s\n]+(?:menu|menyu)[^\s\n]*)',
     ]
     for pattern in menu_patterns:
         match = re.search(pattern, text, re.IGNORECASE)
