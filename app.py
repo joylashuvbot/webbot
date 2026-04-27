@@ -60,8 +60,8 @@ async def init_db():
                 'name': "TEXT NOT NULL DEFAULT ''",
                 'lat': 'DOUBLE PRECISION',
                 'lng': 'DOUBLE PRECISION',
-                'text_user': 'TEXT NOT NULL DEFAULT ''',
-                'text_channel': 'TEXT NOT NULL DEFAULT ''',
+                'text_user': "TEXT NOT NULL DEFAULT ''",
+                'text_channel': "TEXT NOT NULL DEFAULT ''",
             }
 
             for col_name, col_type in required_columns.items():
