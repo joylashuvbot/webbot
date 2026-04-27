@@ -57,7 +57,7 @@ async def init_db():
             logger.info(f"📋 Mavjud ustunlar: {existing_cols}")
 
             required_columns = {
-                'name': 'TEXT NOT NULL DEFAULT ''',
+                'name': "TEXT NOT NULL DEFAULT ''",
                 'lat': 'DOUBLE PRECISION',
                 'lng': 'DOUBLE PRECISION',
                 'text_user': 'TEXT NOT NULL DEFAULT ''',
