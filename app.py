@@ -103,6 +103,7 @@ async def init_db():
                 'lng': 'DOUBLE PRECISION',
                 'text_user': "TEXT NOT NULL DEFAULT ''",
                 'text_channel': "TEXT NOT NULL DEFAULT ''",
+                'category': "TEXT NOT NULL DEFAULT 'food'",
             }
             for col_name, col_type in required_columns.items():
                 if col_name not in existing_cols:
@@ -2547,9 +2548,9 @@ async def create_place(request: web.Request) -> web.Response:
 
         async with db_pool.acquire() as conn:
             row = await conn.fetchrow("""
-                INSERT INTO places (name, lat, lng, text_user, text_channel)
-                VALUES ($1, $2, $3, $4, $5) RETURNING id
-            """, place.get('name'), lat, lng, place.get('text_user', ''), place.get('text_channel', ''))
+                INSERT INTO places (name, lat, lng, text_user, text_channel, category)
+                VALUES ($1, $2, $3, $4, $5, $6) RETURNING id
+            """, place.get('name'), lat, lng, place.get('text_user', ''), place.get('text_channel', ''), place.get('category', 'food'))
             return web.json_response({"success": True, "id": row['id'], "lat": lat, "lng": lng})
     except Exception as e:
         logger.error(f"Create place error: {e}")
@@ -2569,9 +2570,9 @@ async def update_place(request: web.Request) -> web.Response:
 
         async with db_pool.acquire() as conn:
             await conn.execute("""
-                UPDATE places SET name=$1, lat=$2, lng=$3, text_user=$4, text_channel=$5 WHERE id=$6
+                UPDATE places SET name=$1, lat=$2, lng=$3, text_user=$4, text_channel=$5, category=$6 WHERE id=$7
             """, place.get('name'), place.get('lat'), place.get('lng'),
-                place.get('text_user', ''), place.get('text_channel', ''), place_id)
+                place.get('text_user', ''), place.get('text_channel', ''), place.get('category', 'food'), place_id)
             return web.json_response({"success": True})
     except Exception as e:
         logger.error(f"Update place error: {e}")
