@@ -104,6 +104,12 @@ async def init_db():
                 'text_user': "TEXT NOT NULL DEFAULT ''",
                 'text_channel': "TEXT NOT NULL DEFAULT ''",
                 'category': "TEXT NOT NULL DEFAULT 'food'",
+                'phone': "TEXT NOT NULL DEFAULT ''",
+                'telegram': "TEXT NOT NULL DEFAULT ''",
+                'menu_url': "TEXT NOT NULL DEFAULT ''",
+                'address_name': "TEXT NOT NULL DEFAULT ''",
+                'address_link': "TEXT NOT NULL DEFAULT ''",
+                'details': "TEXT NOT NULL DEFAULT ''",
             }
             for col_name, col_type in required_columns.items():
                 if col_name not in existing_cols:
@@ -130,19 +136,48 @@ async def init_db():
 
 async def load_initial_places(conn):
     for place in INITIAL_PLACES:
+        # Parse text_user to extract individual fields
+        place = parse_place_text(dict(place))
+
         lat, lng = place.get("lat"), place.get("lng")
+
+        # First try to extract coords from address_link
         if lat is None or lng is None:
-            text = place.get("text_user") or place.get("text_channel") or ""
-            addr_match = re.search(r'📍\s*([^\n]+)', text)
-            address = addr_match.group(1).strip() if addr_match else place["name"]
-            coords = await geocode_address(address)
-            if coords:
-                lat, lng = coords
-            await asyncio.sleep(1.1)
+            addr_link = place.get("address_link", "")
+            if addr_link:
+                coords = extract_coords_from_url(addr_link)
+                if coords:
+                    lat, lng = coords
+                    place["lat"] = lat
+                    place["lng"] = lng
+
+            # If still no coords, geocode the address name
+            if lat is None or lng is None:
+                addr_name = place.get("address_name", "")
+                if addr_name:
+                    coords = await geocode_address(addr_name)
+                    if coords:
+                        lat, lng = coords
+                        place["lat"] = lat
+                        place["lng"] = lng
+                await asyncio.sleep(1.1)
+
+        # Build text_user and text_channel from individual fields
+        text_user = build_text_user(place)
+        text_channel = build_text_channel(place)
+
         await conn.execute("""
-            INSERT INTO places (name, lat, lng, text_user, text_channel)
-            VALUES ($1, $2, $3, $4, $5)
-        """, place["name"], lat, lng, place["text_user"], place["text_channel"])
+            INSERT INTO places (name, lat, lng, text_user, text_channel, category,
+                              phone, telegram, menu_url, address_name, address_link, details)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        """, place["name"], lat, lng, text_user, text_channel,
+             place.get("category", "food"),
+             place.get("phone", ""),
+             place.get("telegram", ""),
+             place.get("menu_url", ""),
+             place.get("address_name", ""),
+             place.get("address_link", ""),
+             place.get("details", ""))
 
 async def close_db():
     if db_pool:
@@ -175,6 +210,199 @@ async def set_user_language(user_id: int, language: str):
         logger.error(f"Set lang error: {e}")
 
 # ------------------- Initial Places -------------------
+# ------------------- Place Parsing & Building -------------------
+
+def extract_address_name(text: str) -> str:
+    """📍 qatoridan manzil nomini ajratib olish (linkisiz)"""
+    addr_match = re.search(r'📍\s*([^\n(]+)', text)
+    if addr_match:
+        return addr_match.group(1).strip()
+    return ''
+
+def extract_address_link(text: str) -> str:
+    """📍 qatoridagi Google Maps linkini ajratib olish"""
+    link_match = re.search(r'https?://[^\s)]+', text)
+    if link_match:
+        return link_match.group(0).strip()
+    return ''
+
+def extract_phones(text: str) -> str:
+    """📞 qator(lar)idan telefon raqamlarini ajratib olish"""
+    phones = []
+    for line in text.split('\n'):
+        if line.strip().startswith('📞'):
+            phone_match = re.search(r'[+\d][\d\s()-]+', line.strip()) 
+            if phone_match:
+                phones.append(phone_match.group(0).strip())
+    return ', '.join(phones)
+
+def extract_telegram(text: str) -> str:
+    """📱 qator(lar)idan telegram username ni ajratib olish"""
+    tgs = []
+    for line in text.split('\n'):
+        if line.strip().startswith('📱') and '@' in line:
+            # Handle both "@username" and "https://t.me/..." formats
+            usernames = re.findall(r'@([A-Za-z0-9_]+)', line.strip())
+            tgs.extend([f'@{u}' for u in usernames])
+    return ', '.join(tgs)
+
+def extract_menu_url(text: str) -> str:
+    """📋 qatoridan menu URL ni ajratib olish"""
+    for line in text.split('\n'):
+        if line.strip().startswith('📋'):
+            url_match = re.search(r'https?://[^\s)]+', line.strip())
+            if url_match:
+                return url_match.group(0).strip()
+    return ''
+
+def extract_details(text: str) -> str:
+    """Faqat tafsilot qismini ajratib olish (🏬, 🧾, 🚘, ⏰, va h.k.)"""
+    detail_lines = []
+    for line in text.split('\n'):
+        line = line.strip()
+        if not line:
+            continue
+        # Only keep lines that start with specific emojis (details)
+        if line.startswith(('🏠', '🏬', '🚛', '🏪', '🧾', '🍜', '🚘', '🚚', '⏰', '❌', '❗️', '🅿️')):
+            detail_lines.append(line)
+    return '\n'.join(detail_lines)
+
+def build_text_user(place: dict) -> str:
+    """Alohida maydonlardan text_user yaratish"""
+    lines = []
+    name = place.get('name', '')
+    addr_name = place.get('address_name', '')
+    addr_link = place.get('address_link', '')
+    details = place.get('details', '')
+    phone = place.get('phone', '')
+    telegram = place.get('telegram', '')
+    menu_url = place.get('menu_url', '')
+    lat = place.get('lat')
+    lng = place.get('lng')
+
+    # Header
+    lines.append(f'🍽️ {name}')
+
+    # Address with link or coordinates
+    if addr_name:
+        if addr_link:
+            lines.append(f'📍 {addr_name} ({addr_link})')
+        elif lat and lng:
+            lines.append(f'📍 {addr_name} (https://www.google.com/maps?q={lat},{lng})')
+        else:
+            lines.append(f'📍 {addr_name}')
+    elif lat and lng:
+        lines.append(f'📍 https://www.google.com/maps?q={lat},{lng}')
+
+    # Details (only the 4 summary lines)
+    if details:
+        lines.append(details)
+
+    # Menu
+    if menu_url:
+        lines.append(f'📋 Меню ({menu_url}) (смотреть комментарии)')
+
+    # Phone
+    if phone:
+        for p in phone.split(','):
+            p = p.strip()
+            if p:
+                lines.append(f'📞 Телефон: {p}' if p == phone.split(',')[0].strip() else f'📞 {p}')
+
+    # Telegram
+    if telegram:
+        for t in telegram.split(','):
+            t = t.strip()
+            if t:
+                lines.append(f'📱 Telegram: {t}')
+
+    return '\n'.join(lines)
+
+def build_text_channel(place: dict) -> str:
+    """Alohida maydonlardan text_channel (HTML) yaratish"""
+    lines = []
+    name = place.get('name', '')
+    addr_name = place.get('address_name', '')
+    addr_link = place.get('address_link', '')
+    details = place.get('details', '')
+    phone = place.get('phone', '')
+    telegram = place.get('telegram', '')
+    menu_url = place.get('menu_url', '')
+    lat = place.get('lat')
+    lng = place.get('lng')
+
+    # Header with bold
+    lines.append(f'🍽️ <b>{name}</b>')
+
+    # Address with link or coordinates
+    if addr_name:
+        if addr_link:
+            lines.append(f'📍 <a href="{addr_link}">{addr_name}</a>')
+        elif lat and lng:
+            lines.append(f'📍 <a href="https://www.google.com/maps?q={lat},{lng}">{addr_name}</a>')
+        else:
+            lines.append(f'📍 {addr_name}')
+    elif lat and lng:
+        lines.append(f'📍 <a href="https://www.google.com/maps?q={lat},{lng}">Xaritada ko\'rish</a>')
+
+    # Details
+    if details:
+        lines.append(details)
+
+    # Menu
+    if menu_url:
+        lines.append(f'📋 <a href="{menu_url}">Меню</a> (смотреть комментарии)')
+
+    # Phone
+    if phone:
+        for p in phone.split(','):
+            p = p.strip()
+            if p:
+                lines.append(f'📞 Телефон: {p}' if p == phone.split(',')[0].strip() else f'📞 {p}')
+
+    # Telegram
+    if telegram:
+        for t in telegram.split(','):
+            t = t.strip()
+            if t:
+                lines.append(f'📱 Telegram: {t}')
+
+    return '\n'.join(lines)
+
+def parse_place_text(place: dict) -> dict:
+    """Mavjud text_user dan barcha maydonlarni ajratib olish"""
+    text = place.get('text_user', '')
+    if not text:
+        return place
+
+    # Extract address name and link from 📍 line
+    addr_name = extract_address_name(text)
+    addr_link = extract_address_link(text)
+
+    # Extract phone, telegram, menu
+    phone = extract_phones(text)
+    telegram = extract_telegram(text)
+    menu_url = extract_menu_url(text)
+
+    # Extract details (only summary lines)
+    details = extract_details(text)
+
+    # Update place dict
+    if addr_name:
+        place['address_name'] = addr_name
+    if addr_link:
+        place['address_link'] = addr_link
+    if phone:
+        place['phone'] = phone
+    if telegram:
+        place['telegram'] = telegram
+    if menu_url:
+        place['menu_url'] = menu_url
+    if details:
+        place['details'] = details
+
+    return place
+
 INITIAL_PLACES = [
     {
         "name": "ARZU CHICAGO",
@@ -2345,6 +2573,23 @@ def validate_telegram_data(init_data: str, bot_token: str) -> Optional[dict]:
         return None
 
 # ------------------- Geocoding -------------------
+
+def extract_coords_from_url(url: str) -> Optional[tuple]:
+    """Google Maps URL dan lat/lng ni ajratib olish"""
+    if not url:
+        return None
+    patterns = [
+        r'[?&]q=(-?\d+\.\d+),(-?\d+\.\d+)',
+        r'@(-?\d+\.\d+),(-?\d+\.\d+)',
+        r'll=(-?\d+\.\d+),(-?\d+\.\d+)',
+        r'/place/[^/]+/@(-?\d+\.\d+),(-?\d+\.\d+)',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return float(match.group(1)), float(match.group(2))
+    return None
+
 async def geocode_address(address: str) -> Optional[tuple]:
     import aiohttp
     clean = re.sub(r'https?://\S+', '', address)
@@ -2369,32 +2614,50 @@ def parse_place_from_db(row) -> dict:
     r = dict(row)
     text = r.get('text_user') or r.get('text_channel') or ''
 
-    phone = None
-    for pattern in [r'📞\s*Телефон:\s*([+\d\s\-\(\)–]+)', r'📞\s*Telefon:\s*([+\d\s\-\(\)–]+)', r'📞\s*([+\d\s\-\(\)–]+)']:
-        match = re.search(pattern, text)
-        if match:
-            phone = match.group(1).strip()
-            break
+    # Use stored individual fields if available, otherwise parse from text
+    phone = r.get('phone') or None
+    telegram = r.get('telegram') or None
+    menu_url = r.get('menu_url') or None
+    address_name = r.get('address_name') or ''
+    address_link = r.get('address_link') or ''
+    details = r.get('details') or ''
 
-    tg_match = re.search(r'📱\s*(?:Telegram:\s*)?(@[\w\d_]+)', text)
-    telegram = tg_match.group(1) if tg_match else None
-
-    menu_url = None
-    try:
-        for pattern in [
-            r'📋.*?\(?(https?://[^\s\)\n]+)',
-            r'📋\s*<a\s+href=["\']([^"\'\)\n]+)["\']',
-            r'(https?://[^\s\n]+(?:menu|menyu)[^\s\n]*)',
-        ]:
-            match = re.search(pattern, text, re.IGNORECASE)
+    # Fallback: parse from text if DB fields are empty
+    if not phone:
+        for pattern in [r'📞\s*Телефон:\s*([+\d\s\-\(\)–]+)', r'📞\s*Telefon:\s*([+\d\s\-\(\)–]+)', r'📞\s*([+\d\s\-\(\)–]+)']:
+            match = re.search(pattern, text)
             if match:
-                menu_url = match.group(1).strip().rstrip(')')
+                phone = match.group(1).strip()
                 break
-    except Exception:
-        pass
 
-    addr_match = re.search(r'📍\s*([^\n]+)', text)
-    address = addr_match.group(1).strip() if addr_match else r.get('name', 'Unknown')
+    if not telegram:
+        tg_match = re.search(r'📱\s*(?:Telegram:\s*)?(@[\w\d_]+)', text)
+        telegram = tg_match.group(1) if tg_match else None
+
+    if not menu_url:
+        try:
+            for pattern in [
+                r'📋.*?\(?(https?://[^\s\)\n]+)',
+                r'📋\s*<a\s+href=["\']([^"\'\)\n]+)["\']',
+                r'(https?://[^\s\n]+(?:menu|menyu)[^\s\n]*)',
+            ]:
+                match = re.search(pattern, text, re.IGNORECASE)
+                if match:
+                    menu_url = match.group(1).strip().rstrip(')')
+                    break
+        except Exception:
+            pass
+
+    if not address_name:
+        addr_match = re.search(r'📍\s*([^\n(]+)', text)
+        address_name = addr_match.group(1).strip() if addr_match else r.get('name', 'Unknown')
+
+    if not address_link:
+        link_match = re.search(r'https?://[^\s)]+', text)
+        address_link = link_match.group(0).strip() if link_match else ''
+
+    if not details:
+        details = extract_details(text) if text else ''
 
     time_match = re.search(r'⏰\s*([^\n]+)', text)
     work_time = time_match.group(1).strip() if time_match else None
@@ -2404,8 +2667,11 @@ def parse_place_from_db(row) -> dict:
     return {
         "id": r.get('id'), "name": r.get('name', 'Unknown'), "description": text[:300] if text else '',
         "category": "food", "lat": r.get('lat'), "lng": r.get('lng'),
-        "city": address, "address": address, "phone": phone, "telegram": telegram,
-        "menu_url": menu_url, "work_time": work_time, "delivery": delivery
+        "city": address_name, "address": address_name, "phone": phone, "telegram": telegram,
+        "menu_url": menu_url, "work_time": work_time, "delivery": delivery,
+        "text_user": text, "text_channel": r.get('text_channel', ''),
+        "address_name": address_name, "address_link": address_link,
+        "details": details, "maps_url": address_link
     }
 
 # ------------------- API Handlers -------------------
@@ -2537,20 +2803,56 @@ async def create_place(request: web.Request) -> web.Response:
             return web.json_response({"success": False, "error": "Unauthorized"}, status=403)
 
         place = data.get('place', {})
-        lat, lng, address = place.get('lat'), place.get('lng'), place.get('address', '')
-        if (not lat or not lng) and address:
-            coords = await geocode_address(address)
+
+        # Extract individual fields
+        lat = place.get('lat')
+        lng = place.get('lng')
+        address_name = place.get('address_name', place.get('address', ''))
+        address_link = place.get('address_link', place.get('maps_url', ''))
+        phone = place.get('phone', '')
+        telegram = place.get('telegram', '')
+        menu_url = place.get('menu_url', '')
+        details = place.get('details', place.get('text_user', ''))
+
+        # Auto-extract coords from address_link if not provided
+        if (not lat or not lng) and address_link:
+            coords = extract_coords_from_url(address_link)
             if coords:
                 lat, lng = coords
+
+        # Fallback: geocode by address name
+        if (not lat or not lng) and address_name:
+            coords = await geocode_address(address_name)
+            if coords:
+                lat, lng = coords
+
+        # Build text_user and text_channel from individual fields
+        build_data = {
+            'name': place.get('name', ''),
+            'address_name': address_name,
+            'address_link': address_link,
+            'phone': phone,
+            'telegram': telegram,
+            'menu_url': menu_url,
+            'details': details,
+            'lat': lat,
+            'lng': lng,
+            'category': place.get('category', 'food'),
+        }
+        text_user = build_text_user(build_data)
+        text_channel = build_text_channel(build_data)
 
         if db_pool is None:
             return web.json_response({"success": False, "error": "Database not connected"}, status=500)
 
         async with db_pool.acquire() as conn:
             row = await conn.fetchrow("""
-                INSERT INTO places (name, lat, lng, text_user, text_channel, category)
-                VALUES ($1, $2, $3, $4, $5, $6) RETURNING id
-            """, place.get('name'), lat, lng, place.get('text_user', ''), place.get('text_channel', ''), place.get('category', 'food'))
+                INSERT INTO places (name, lat, lng, text_user, text_channel, category,
+                                  phone, telegram, menu_url, address_name, address_link, details)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING id
+            """, place.get('name'), lat, lng, text_user, text_channel,
+                 place.get('category', 'food'),
+                 phone, telegram, menu_url, address_name, address_link, details)
             return web.json_response({"success": True, "id": row['id'], "lat": lat, "lng": lng})
     except Exception as e:
         logger.error(f"Create place error: {e}")
@@ -2565,15 +2867,51 @@ async def update_place(request: web.Request) -> web.Response:
             return web.json_response({"success": False, "error": "Unauthorized"}, status=403)
 
         place = data.get('place', {})
+
+        # Extract individual fields
+        lat = place.get('lat')
+        lng = place.get('lng')
+        address_name = place.get('address_name', place.get('address', ''))
+        address_link = place.get('address_link', place.get('maps_url', ''))
+        phone = place.get('phone', '')
+        telegram = place.get('telegram', '')
+        menu_url = place.get('menu_url', '')
+        details = place.get('details', place.get('text_user', ''))
+
+        # Auto-extract coords from address_link if coords missing
+        if (not lat or not lng) and address_link:
+            coords = extract_coords_from_url(address_link)
+            if coords:
+                lat, lng = coords
+
+        # Build text_user and text_channel from individual fields
+        build_data = {
+            'name': place.get('name', ''),
+            'address_name': address_name,
+            'address_link': address_link,
+            'phone': phone,
+            'telegram': telegram,
+            'menu_url': menu_url,
+            'details': details,
+            'lat': lat,
+            'lng': lng,
+            'category': place.get('category', 'food'),
+        }
+        text_user = build_text_user(build_data)
+        text_channel = build_text_channel(build_data)
+
         if db_pool is None:
             return web.json_response({"success": False, "error": "Database not connected"}, status=500)
 
         async with db_pool.acquire() as conn:
             await conn.execute("""
-                UPDATE places SET name=$1, lat=$2, lng=$3, text_user=$4, text_channel=$5, category=$6 WHERE id=$7
-            """, place.get('name'), place.get('lat'), place.get('lng'),
-                place.get('text_user', ''), place.get('text_channel', ''), place.get('category', 'food'), place_id)
-            return web.json_response({"success": True})
+                UPDATE places SET name=$1, lat=$2, lng=$3, text_user=$4, text_channel=$5, category=$6,
+                                  phone=$7, telegram=$8, menu_url=$9, address_name=$10, address_link=$11, details=$12
+                WHERE id=$13
+            """, place.get('name'), lat, lng, text_user, text_channel,
+                 place.get('category', 'food'),
+                 phone, telegram, menu_url, address_name, address_link, details, place_id)
+            return web.json_response({"success": True, "lat": lat, "lng": lng})
     except Exception as e:
         logger.error(f"Update place error: {e}")
         return web.json_response({"success": False, "error": str(e)}, status=500)
@@ -2608,15 +2946,32 @@ async def geocode_place(request: web.Request) -> web.Response:
             return web.json_response({"success": False, "error": "Database not connected"}, status=500)
 
         async with db_pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT id, name, text_user, text_channel FROM places WHERE id = $1", place_id)
+            row = await conn.fetchrow("SELECT id, name, text_user, text_channel, address_name, address_link FROM places WHERE id = $1", place_id)
             if not row:
                 return web.json_response({"success": False, "error": "Place not found"}, status=404)
 
-            text = row['text_user'] or row['text_channel'] or ''
-            addr_match = re.search(r'📍\s*([^\n]+)', text)
-            address = addr_match.group(1).strip() if addr_match else row['name']
+            # First try to extract coords from address_link
+            coords = None
+            addr_link = row.get('address_link') or ''
+            if addr_link:
+                coords = extract_coords_from_url(addr_link)
 
-            coords = await geocode_address(address)
+            # Fallback: parse from text_user
+            if not coords:
+                text = row['text_user'] or row['text_channel'] or ''
+                link_match = re.search(r'https?://[^\s)]+', text)
+                if link_match:
+                    coords = extract_coords_from_url(link_match.group(0))
+
+            # Last resort: geocode by address name
+            if not coords:
+                addr_name = row.get('address_name') or row['name']
+                if not addr_name:
+                    text = row['text_user'] or row['text_channel'] or ''
+                    addr_match = re.search(r'📍\s*([^\n(]+)', text)
+                    addr_name = addr_match.group(1).strip() if addr_match else row['name']
+                coords = await geocode_address(addr_name)
+
             if coords:
                 await conn.execute("UPDATE places SET lat = $1, lng = $2 WHERE id = $3", coords[0], coords[1], place_id)
                 return web.json_response({"success": True, "lat": coords[0], "lng": coords[1]})
@@ -2636,19 +2991,38 @@ async def geocode_all_places(request: web.Request) -> web.Response:
             return web.json_response({"success": False, "error": "Database not connected"}, status=500)
 
         async with db_pool.acquire() as conn:
-            rows = await conn.fetch("SELECT id, name, text_user, text_channel FROM places WHERE lat IS NULL OR lng IS NULL")
+            rows = await conn.fetch("SELECT id, name, text_user, text_channel, address_name, address_link FROM places WHERE lat IS NULL OR lng IS NULL")
             updated, failed = 0, 0
             for row in rows:
-                text = row['text_user'] or row['text_channel'] or ''
-                addr_match = re.search(r'📍\s*([^\n]+)', text)
-                address = addr_match.group(1).strip() if addr_match else row['name']
-                coords = await geocode_address(address)
+                coords = None
+
+                # First try to extract coords from address_link
+                addr_link = row.get('address_link') or ''
+                if addr_link:
+                    coords = extract_coords_from_url(addr_link)
+
+                # Fallback: parse from text_user
+                if not coords:
+                    text = row['text_user'] or row['text_channel'] or ''
+                    link_match = re.search(r'https?://[^\s)]+', text)
+                    if link_match:
+                        coords = extract_coords_from_url(link_match.group(0))
+
+                # Last resort: geocode by address name
+                if not coords:
+                    addr_name = row.get('address_name') or row['name']
+                    if not addr_name:
+                        text = row['text_user'] or row['text_channel'] or ''
+                        addr_match = re.search(r'📍\s*([^\n(]+)', text)
+                        addr_name = addr_match.group(1).strip() if addr_match else row['name']
+                    coords = await geocode_address(addr_name)
+                    await asyncio.sleep(1.1)
+
                 if coords:
                     await conn.execute("UPDATE places SET lat = $1, lng = $2 WHERE id = $3", coords[0], coords[1], row['id'])
                     updated += 1
                 else:
                     failed += 1
-                await asyncio.sleep(1.1)
             return web.json_response({"success": True, "updated": updated, "failed": failed})
     except Exception as e:
         logger.error(f"Geocode all error: {e}")
