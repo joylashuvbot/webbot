@@ -9,6 +9,7 @@ from typing import Optional, Dict, Any, List
 from urllib.parse import parse_qsl
 import asyncio
 import asyncpg
+import aiohttp
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types
 from aiogram.enums import ParseMode
@@ -2590,6 +2591,31 @@ def extract_coords_from_url(url: str) -> Optional[tuple]:
             return float(match.group(1)), float(match.group(2))
     return None
 
+async def resolve_shortened_maps_link(url: str) -> Optional[tuple]:
+    """Qisqartilgan Google Maps linkini (maps.app.goo.gl) kengaytirib koordinatalarni olib olish"""
+    if not url:
+        return None
+    
+    # Agar already extracted coords mavjud bo'lsa, uni qaytarish
+    coords = extract_coords_from_url(url)
+    if coords:
+        return coords
+    
+    # goo.gl yoki maps.app.goo.gl linkni kengaytirish
+    try:
+        async with aiohttp.ClientSession() as session:
+            # allow_redirects=True bilan redirect qiladi
+            async with session.get(url, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    final_url = str(resp.url)
+                    coords = extract_coords_from_url(final_url)
+                    if coords:
+                        return coords
+    except Exception as e:
+        logger.error(f"Resolve shortened link error: {e}")
+    
+    return None
+
 async def geocode_address(address: str) -> Optional[tuple]:
     import aiohttp
     clean = re.sub(r'https?://\S+', '', address)
@@ -3028,6 +3054,26 @@ async def geocode_all_places(request: web.Request) -> web.Response:
         logger.error(f"Geocode all error: {e}")
         return web.json_response({"success": False, "error": str(e)}, status=500)
 
+async def resolve_maps_link(request: web.Request) -> web.Response:
+    """Qisqartilgan yoki to'liq Google Maps linkdan koordinatalarni olib olish"""
+    try:
+        data = await request.json()
+        url = data.get('url', '').strip()
+        
+        if not url:
+            return web.json_response({"success": False, "error": "URL required"}, status=400)
+        
+        # Qisqartilgan linkni kengaytirish
+        coords = await resolve_shortened_maps_link(url)
+        
+        if coords:
+            return web.json_response({"success": True, "lat": coords[0], "lng": coords[1]})
+        
+        return web.json_response({"success": False, "error": "Koordinatalar topilmadi"}, status=400)
+    except Exception as e:
+        logger.error(f"Resolve link error: {e}")
+        return web.json_response({"success": False, "error": str(e)}, status=500)
+
 async def debug_db(request: web.Request) -> web.Response:
     try:
         if db_pool is None:
@@ -3203,6 +3249,7 @@ async def init_app():
     app.router.add_post('/api/places', create_place)
     app.router.add_post('/api/places/{id}/geocode', geocode_place)
     app.router.add_post('/api/admin/geocode-all', geocode_all_places)
+    app.router.add_post('/api/admin/resolve-link', resolve_maps_link)  # LINK KENGAYTIRISH
     app.router.add_put('/api/places/{id}', update_place)
     app.router.add_delete('/api/places/{id}', delete_place)
     app.router.add_get('/api/debug/db', debug_db)
