@@ -2576,19 +2576,38 @@ def validate_telegram_data(init_data: str, bot_token: str) -> Optional[dict]:
 # ------------------- Geocoding -------------------
 
 def extract_coords_from_url(url: str) -> Optional[tuple]:
-    """Google Maps URL dan lat/lng ni ajratib olish"""
+    """Google Maps URL dan lat/lng ni ajratib olish - kengaytirilgan"""
     if not url:
         return None
+
     patterns = [
-        r'[?&]q=(-?\d+\.\d+),(-?\d+\.\d+)',
+        # @lat,lng format (eng keng tarqalgan)
         r'@(-?\d+\.\d+),(-?\d+\.\d+)',
+        # ?q=lat,lng format
+        r'[?&]q=(-?\d+\.\d+),(-?\d+\.\d+)',
+        # ll=lat,lng format
         r'll=(-?\d+\.\d+),(-?\d+\.\d+)',
+        # /place/.../@lat,lng
         r'/place/[^/]+/@(-?\d+\.\d+),(-?\d+\.\d+)',
+        # /maps?q=lat,lng
+        r'maps\?.*q=(-?\d+\.\d+),(-?\d+\.\d+)',
+        # /maps/place/.../@lat,lng
+        r'/maps/place/[^/]+/@(-?\d+\.\d+),(-?\d+\.\d+)',
+        # data=!4m2!3m1!1s0x... (Google Maps place ID format - skip)
+        # But try to find coordinates anywhere in the URL
+        r'(-?\d{2,3}\.\d{4,}),(-?\d{2,3}\.\d{4,})',
     ]
+
     for pattern in patterns:
         match = re.search(pattern, url)
         if match:
-            return float(match.group(1)), float(match.group(2))
+            lat = float(match.group(1))
+            lng = float(match.group(2))
+            # Validate coordinates
+            if -90 <= lat <= 90 and -180 <= lng <= 180:
+                logger.info(f"Coords extracted: lat={lat}, lng={lng}")
+                return lat, lng
+
     return None
 
 async def resolve_shortened_maps_link(url: str) -> Optional[tuple]:
