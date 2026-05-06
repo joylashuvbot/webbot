@@ -43,6 +43,7 @@ async def check_admin_auth(data: dict) -> Optional[dict]:
     Birlashtirilgan autentifikatsiya:
     1. Admin token orqali (brauzer rejimi)
     2. Telegram init_data orqali (WebApp rejimi)
+    3. Brauzer rejimi (demo_mode_ prefix bilan)
     """
     init_data = data.get('init_data', '')
     admin_token = data.get('admin_token', '')
@@ -58,14 +59,25 @@ async def check_admin_auth(data: dict) -> Optional[dict]:
         }
 
     if init_data:
-        user = validate_telegram_data(init_data, BOT_TOKEN)
-        if user:
-            user_id = user.get('id')
-            user['is_admin'] = user_id in ADMIN_IDS
-            return user
+        # Telegram WebApp auth
+        if not init_data.startswith('demo_mode_'):
+            user = validate_telegram_data(init_data, BOT_TOKEN)
+            if user:
+                user_id = user.get('id')
+                user['is_admin'] = user_id in ADMIN_IDS
+                return user
+        else:
+            # Brauzer rejimi - demo_mode_ prefix bilan
+            return {
+                "id": 0,
+                "first_name": "Browser Admin",
+                "last_name": "",
+                "username": "admin",
+                "language_code": "uz",
+                "is_admin": True
+            }
 
     return None
-
 # ------------------- Database -------------------
 db_pool: Optional[asyncpg.Pool] = None
 
