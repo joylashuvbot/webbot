@@ -2633,54 +2633,72 @@ async def resolve_shortened_maps_link(url: str) -> Optional[tuple]:
     if coords:
         return coords
     
-    # Qisqa linklarni kengaytirish
-    shortened_domains = ['goo.gl', 'maps.app.goo.gl', 'maps.google.com']
-    is_shortened = any(domain in url.lower() for domain in shortened_domains)
+    # Qisqa/Google linklarni kengaytirish
+    maps_domains = ['goo.gl', 'maps.app.goo.gl', 'maps.google.com', 'google.com/maps']
+    is_maps = any(domain in url.lower() for domain in maps_domains)
     
-    if not is_shortened:
+    if not is_maps:
         return None
     
     try:
         import aiohttp
         
-        # REAL BROWSER User-Agent header
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate',
         }
         
         async with aiohttp.ClientSession(headers=headers) as session:
-            # GET so'rov bilan redirect kuzatish
-            async with session.get(url, allow_redirects=True, max_redirects=5, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                # Final URL dan koordinatalarni olish
-                final_url = str(resp.url)
-                coords = extract_coords_from_url(final_url)
-                if coords:
-                    return coords
-                
-                # HTML'dan koordinatalarni qidirish
-                if resp.status == 200:
-                    text = await resp.text()
+            try:
+                # GET so'rov - redirect ni kuzatish
+                async with session.get(
+                    url, 
+                    allow_redirects=True, 
+                    max_redirects=10,
+                    timeout=aiohttp.ClientTimeout(total=20)
+                ) as resp:
+                    final_url = str(resp.url)
+                    logger.info(f"Final URL after redirect: {final_url}")
                     
-                    patterns = [
-                        r'@(-?\d+\.\d+),(-?\d+\.\d+)',
-                        r'data=!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)',
-                        r'lat":(-?\d+\.\d+),"lng":(-?\d+\.\d+)',
-                        r'"(-?\d+\.\d+),(-?\d+\.\d+)"',
-                        r'!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)',
-                        r'q=(-?\d+\.\d+),(-?\d+\.\d+)',
-                    ]
-                    for pattern in patterns:
-                        match = re.search(pattern, text)
-                        if match:
-                            lat = float(match.group(1))
-                            lng = float(match.group(2))
-                            if -90 <= lat <= 90 and -180 <= lng <= 180:
-                                return lat, lng
+                    # Final URL dan koordinatalarni olish
+                    coords = extract_coords_from_url(final_url)
+                    if coords:
+                        logger.info(f"Coords from final URL: {coords}")
+                        return coords
+                    
+                    # HTML content dan qidirish
+                    if resp.status == 200:
+                        text = await resp.text()
                         
+                        # Google Maps JavaScript ichidagi koordinatlar
+                        html_patterns = [
+                            r'@(-?\d+\.\d+),(-?\d+\.\d+)',
+                            r'!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)',
+                            r'"lat":(-?\d+\.\d+),"lng":(-?\d+\.\d+)',
+                            r'"latitude":(-?\d+\.\d+),"longitude":(-?\d+\.\d+)',
+                            r'center=(-?\d+\.\d+),(-?\d+\.\d+)',
+                            r'q=(-?\d+\.\d+),(-?\d+\.\d+)',
+                            r'data=.*?!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)',
+                        ]
+                        for pattern in html_patterns:
+                            match = re.search(pattern, text)
+                            if match:
+                                lat = float(match.group(1))
+                                lng = float(match.group(2))
+                                if -90 <= lat <= 90 and -180 <= lng <= 180:
+                                    logger.info(f"Coords from HTML ({pattern}): {lat},{lng}")
+                                    return lat, lng
+                        
+                        logger.warning(f"HTML tahlil qilindi lekin koordinat topilmadi. HTML uzunligi: {len(text)}")
+                    else:
+                        logger.warning(f"HTTP status {resp.status} for {url}")
+            except aiohttp.ClientError as e:
+                logger.error(f"HTTP client error for {url}: {e}")
+                
     except Exception as e:
-        logger.error(f"Resolve shortened link error: {e}")
+        logger.error(f"Resolve shortened link error: {type(e).__name__}: {e}")
     
     return None
 
@@ -3127,30 +3145,39 @@ async def resolve_maps_link(request: web.Request) -> web.Response:
     try:
         data = await request.json()
         
-        # ✅ Admin autentifikatsiya tekshirish
+        # Admin autentifikatsiya tekshirish
         user = await check_admin_auth(data)
         if not user or not user.get('is_admin'):
             return web.json_response({"success": False, "error": "Unauthorized"}, status=403)
         
         url = data.get('url', '').strip()
-        
         if not url:
             return web.json_response({"success": False, "error": "URL required"}, status=400)
         
-        # Avval to'liq URL dan koordinatalarni olish
+        logger.info(f"resolve_maps_link: URL={url}")
+        
+        # 1. To'g'ridan-to'g'ri URL tahlil
         coords = extract_coords_from_url(url)
         if coords:
-            return web.json_response({"success": True, "lat": coords[0], "lng": coords[1]})
+            logger.info(f"Coords from direct parse: {coords}")
+            return web.json_response({"success": True, "lat": coords[0], "lng": coords[1], "method": "direct"})
         
-        # Qisqartilgan linkni kengaytirish
+        # 2. Qisqartilgan linkni kengaytirish
+        logger.info(f"Direct parse failed, trying redirect resolve...")
         coords = await resolve_shortened_maps_link(url)
-        
         if coords:
-            return web.json_response({"success": True, "lat": coords[0], "lng": coords[1]})
+            logger.info(f"Coords from redirect: {coords}")
+            return web.json_response({"success": True, "lat": coords[0], "lng": coords[1], "method": "redirect"})
         
-        return web.json_response({"success": False, "error": "Koordinatalar topilmadi"}, status=400)
+        logger.warning(f"All methods failed for URL: {url}")
+        return web.json_response({
+            "success": False, 
+            "error": "Koordinatalar topilmadi. Manzil nomini kiriting yoki koordinatni qo'lda kiriting.",
+            "url": url
+        }, status=400)
+        
     except Exception as e:
-        logger.error(f"Resolve link error: {e}")
+        logger.error(f"resolve_maps_link exception: {type(e).__name__}: {e}")
         return web.json_response({"success": False, "error": str(e)}, status=500)
 
 async def debug_db(request: web.Request) -> web.Response:
