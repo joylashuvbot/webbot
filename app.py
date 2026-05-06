@@ -16,6 +16,7 @@ from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import CommandStart
 from dotenv import load_dotenv
+from urllib.parse import unquote
 
 load_dotenv()
 
@@ -2611,25 +2612,72 @@ def extract_coords_from_url(url: str) -> Optional[tuple]:
     return None
 
 async def resolve_shortened_maps_link(url: str) -> Optional[tuple]:
-    """Qisqartilgan Google Maps linkini (maps.app.goo.gl) kengaytirib koordinatalarni olib olish"""
+    """Qisqartilgan Google Maps linkini (maps.app.goo.gl, goo.gl/maps) kengaytirib koordinatalarni olish"""
     if not url:
         return None
     
-    # Agar already extracted coords mavjud bo'lsa, uni qaytarish
+    # Agar already to'liq URL bo'lsa, to'g'ridan-to'g'ri koordinatalarni olish
     coords = extract_coords_from_url(url)
     if coords:
         return coords
     
-    # goo.gl yoki maps.app.goo.gl linkni kengaytirish
+    # Qisqa linklarni kengaytirish - redirect header'dan foydalanish
+    shortened_domains = ['goo.gl', 'maps.app.goo.gl', 'maps.google.com']
+    is_shortened = any(domain in url.lower() for domain in shortened_domains)
+    
+    if not is_shortened:
+        return None
+    
     try:
+        import aiohttp
+        
         async with aiohttp.ClientSession() as session:
-            # allow_redirects=True bilan redirect qiladi
-            async with session.get(url, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            # Birinchi: redirect header'dan to'liq URL olish (follow_redirects=False)
+            async with session.get(url, allow_redirects=False, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status in (301, 302, 307, 308):
+                    location = resp.headers.get('Location', '')
+                    if location:
+                        # Location header'dan koordinatalarni olish
+                        coords = extract_coords_from_url(location)
+                        if coords:
+                            return coords
+                        
+                        # Agar location'da koordinata bo'lmasa, uni decode qilib yana tekshirish
+                        decoded = unquote(location) if '%' in location else location
+                        coords = extract_coords_from_url(decoded)
+                        if coords:
+                            return coords
+            
+            # Ikkinchi: agar redirect header'da topilmasa, follow qilib HTML'dan qidirish
+            async with session.get(url, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 if resp.status == 200:
-                    final_url = str(resp.url)
-                    coords = extract_coords_from_url(final_url)
-                    if coords:
-                        return coords
+                    # JavaScript redirect yoki meta redirect bo'lishi mumkin
+                    text = await resp.text()
+                    
+                    # HTML'dan koordinatalarni qidirish (Google Maps preview sahifasi)
+                    # Masalan: @40.6892494,-74.0445004 yoki data=!3d40.6892494!4d-74.0445004
+                    patterns = [
+                        r'@(-?\d+\.\d+),(-?\d+\.\d+)',
+                        r'data=!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)',
+                        r'lat":(-?\d+\.\d+),"lng":(-?\d+\.\d+)',
+                        r'"(-?\d+\.\d+),(-?\d+\.\d+)"',
+                    ]
+                    for pattern in patterns:
+                        match = re.search(pattern, text)
+                        if match:
+                            lat = float(match.group(1))
+                            lng = float(match.group(2))
+                            if -90 <= lat <= 90 and -180 <= lng <= 180:
+                                return lat, lng
+                    
+                    # Google Maps preview URL'dan koordinatalarni olish
+                    # URL ichida /maps/place/.../@lat,lng format
+                    map_url_match = re.search(r'https://www\.google\.com/maps/[^"\']+', text)
+                    if map_url_match:
+                        coords = extract_coords_from_url(map_url_match.group(0))
+                        if coords:
+                            return coords
+                        
     except Exception as e:
         logger.error(f"Resolve shortened link error: {e}")
     
