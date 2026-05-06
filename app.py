@@ -2612,16 +2612,16 @@ def extract_coords_from_url(url: str) -> Optional[tuple]:
     return None
 
 async def resolve_shortened_maps_link(url: str) -> Optional[tuple]:
-    """Qisqartilgan Google Maps linkini (maps.app.goo.gl, goo.gl/maps) kengaytirib koordinatalarni olish"""
+    """Qisqartilgan Google Maps linkini kengaytirib koordinatalarni olish"""
     if not url:
         return None
     
-    # Agar already to'liq URL bo'lsa, to'g'ridan-to'g'ri koordinatalarni olish
+    # Avval to'liq URL dan koordinatalarni olish
     coords = extract_coords_from_url(url)
     if coords:
         return coords
     
-    # Qisqa linklarni kengaytirish - redirect header'dan foydalanish
+    # Qisqa linklarni kengaytirish
     shortened_domains = ['goo.gl', 'maps.app.goo.gl', 'maps.google.com']
     is_shortened = any(domain in url.lower() for domain in shortened_domains)
     
@@ -2631,36 +2631,33 @@ async def resolve_shortened_maps_link(url: str) -> Optional[tuple]:
     try:
         import aiohttp
         
-        async with aiohttp.ClientSession() as session:
-            # Birinchi: redirect header'dan to'liq URL olish (follow_redirects=False)
-            async with session.get(url, allow_redirects=False, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status in (301, 302, 307, 308):
-                    location = resp.headers.get('Location', '')
-                    if location:
-                        # Location header'dan koordinatalarni olish
-                        coords = extract_coords_from_url(location)
-                        if coords:
-                            return coords
-                        
-                        # Agar location'da koordinata bo'lmasa, uni decode qilib yana tekshirish
-                        decoded = unquote(location) if '%' in location else location
-                        coords = extract_coords_from_url(decoded)
-                        if coords:
-                            return coords
-            
-            # Ikkinchi: agar redirect header'da topilmasa, follow qilib HTML'dan qidirish
-            async with session.get(url, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+        # REAL BROWSER User-Agent header
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+        }
+        
+        async with aiohttp.ClientSession(headers=headers) as session:
+            # GET so'rov bilan redirect kuzatish
+            async with session.get(url, allow_redirects=True, max_redirects=5, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                # Final URL dan koordinatalarni olish
+                final_url = str(resp.url)
+                coords = extract_coords_from_url(final_url)
+                if coords:
+                    return coords
+                
+                # HTML'dan koordinatalarni qidirish
                 if resp.status == 200:
-                    # JavaScript redirect yoki meta redirect bo'lishi mumkin
                     text = await resp.text()
                     
-                    # HTML'dan koordinatalarni qidirish (Google Maps preview sahifasi)
-                    # Masalan: @40.6892494,-74.0445004 yoki data=!3d40.6892494!4d-74.0445004
                     patterns = [
                         r'@(-?\d+\.\d+),(-?\d+\.\d+)',
                         r'data=!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)',
                         r'lat":(-?\d+\.\d+),"lng":(-?\d+\.\d+)',
                         r'"(-?\d+\.\d+),(-?\d+\.\d+)"',
+                        r'!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)',
+                        r'q=(-?\d+\.\d+),(-?\d+\.\d+)',
                     ]
                     for pattern in patterns:
                         match = re.search(pattern, text)
@@ -2669,14 +2666,6 @@ async def resolve_shortened_maps_link(url: str) -> Optional[tuple]:
                             lng = float(match.group(2))
                             if -90 <= lat <= 90 and -180 <= lng <= 180:
                                 return lat, lng
-                    
-                    # Google Maps preview URL'dan koordinatalarni olish
-                    # URL ichida /maps/place/.../@lat,lng format
-                    map_url_match = re.search(r'https://www\.google\.com/maps/[^"\']+', text)
-                    if map_url_match:
-                        coords = extract_coords_from_url(map_url_match.group(0))
-                        if coords:
-                            return coords
                         
     except Exception as e:
         logger.error(f"Resolve shortened link error: {e}")
@@ -3125,10 +3114,21 @@ async def resolve_maps_link(request: web.Request) -> web.Response:
     """Qisqartilgan yoki to'liq Google Maps linkdan koordinatalarni olib olish"""
     try:
         data = await request.json()
+        
+        # ✅ Admin autentifikatsiya tekshirish
+        user = await check_admin_auth(data)
+        if not user or not user.get('is_admin'):
+            return web.json_response({"success": False, "error": "Unauthorized"}, status=403)
+        
         url = data.get('url', '').strip()
         
         if not url:
             return web.json_response({"success": False, "error": "URL required"}, status=400)
+        
+        # Avval to'liq URL dan koordinatalarni olish
+        coords = extract_coords_from_url(url)
+        if coords:
+            return web.json_response({"success": True, "lat": coords[0], "lng": coords[1]})
         
         # Qisqartilgan linkni kengaytirish
         coords = await resolve_shortened_maps_link(url)
