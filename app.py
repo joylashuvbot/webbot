@@ -3129,22 +3129,30 @@ async def geocode_all_places(request: web.Request) -> web.Response:
 
 async def resolve_maps_link(url: str) -> dict:
     url = url.strip()  # Bo'shliqlarni olib tashlash (sizning URLda trailing space bor edi!)
+    logging.info(f"[RESOLVE] resolve_maps_link called with: {url}")
     
     # 1. To'g'ridan-to'g'ri koordinat bor-yo'qligini tekshirish
     coords = extract_coords_from_url(url)
+    logging.info(f"[RESOLVE] Direct extraction result: {coords}")
     if coords:
-        return {"lat": coords[0], "lng": coords[1]}
+        result = {"lat": coords[0], "lng": coords[1]}
+        logging.info(f"[RESOLVE] Found direct coordinates: {result}")
+        return result
     
     # 2. Short URL ni kengaytirish (redirect orqali)
     try:
         expanded_url = await expand_short_url(url)
-        logging.info(f"Expanded URL: {expanded_url}")
+        logging.info(f"[RESOLVE] Expanded URL: {expanded_url}")
         coords = extract_coords_from_url(expanded_url)
+        logging.info(f"[RESOLVE] After expansion extraction: {coords}")
         if coords:
-            return {"lat": coords[0], "lng": coords[1]}
+            result = {"lat": coords[0], "lng": coords[1]}
+            logging.info(f"[RESOLVE] Found coordinates after expansion: {result}")
+            return result
     except Exception as e:
-        logging.error(f"Expand failed: {e}")
+        logging.error(f"[RESOLVE] Expand failed: {e}")
     
+    logging.warning(f"[RESOLVE] No coordinates found for: {url}")
     return None
 
 async def expand_short_url(url: str) -> str:
@@ -3332,10 +3340,13 @@ async def resolve_link_endpoint(request):
         return web.json_response({"error": "URL kerak"}, status=400)
     
     result = await resolve_maps_link(url)
+    logging.info(f"[RESOLVE] resolve_maps_link returned: {result}, type: {type(result)}")
     
     if result:
+        logging.info(f"[RESOLVE] Returning: {result}")
         return web.json_response(result)
     else:
+        logging.warning(f"[RESOLVE] No coordinates found for URL: {url}")
         return web.json_response(
             {"error": "Koordinat topilmadi"}, 
             status=400
