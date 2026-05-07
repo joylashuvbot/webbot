@@ -5,6 +5,7 @@ import hashlib
 import logging
 import re
 import secrets
+import requests
 from typing import Optional, Dict, Any, List, Tuple
 from urllib.parse import parse_qsl
 import asyncio
@@ -17,7 +18,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import CommandStart
 from dotenv import load_dotenv
 from urllib.parse import unquote
-
+import logging
 
 load_dotenv()
 
@@ -2589,39 +2590,19 @@ def validate_telegram_data(init_data: str, bot_token: str) -> Optional[dict]:
 
 # ------------------- Geocoding -------------------
 
-def extract_coords_from_url(url: str) -> Optional[tuple]:
-    """Google Maps URL dan lat/lng ni ajratib olish - kengaytirilgan"""
-    if not url:
-        return None
-
+def extract_coords_from_url(url: str):
+    """URL dan koordinatlarni regex bilan ajratib olish"""
     patterns = [
-        # @lat,lng format (eng keng tarqalgan)
-        r'@(-?\d+\.\d+),(-?\d+\.\d+)',
-        # ?q=lat,lng format
-        r'[?&]q=(-?\d+\.\d+),(-?\d+\.\d+)',
-        # ll=lat,lng format
-        r'll=(-?\d+\.\d+),(-?\d+\.\d+)',
-        # /place/.../@lat,lng
-        r'/place/[^/]+/@(-?\d+\.\d+),(-?\d+\.\d+)',
-        # /maps?q=lat,lng
-        r'maps\?.*q=(-?\d+\.\d+),(-?\d+\.\d+)',
-        # /maps/place/.../@lat,lng
-        r'/maps/place/[^/]+/@(-?\d+\.\d+),(-?\d+\.\d+)',
-        # data=!4m2!3m1!1s0x... (Google Maps place ID format - skip)
-        # But try to find coordinates anywhere in the URL
-        r'(-?\d{2,3}\.\d{4,}),(-?\d{2,3}\.\d{4,})',
+        r'@(-?\d+\.?\d*),(-?\d+\.?\d*)',          # @lat,lng
+        r'[?&]ll=(-?\d+\.?\d*),(-?\d+\.?\d*)',     # ll=lat,lng
+        r'/place/[^/]+/([^/]+)',                     # place format
+        r'!3d(-?\d+\.?\d*)!4d(-?\d+\.?\d*)',        # !3d lat !4d lng
+        r'[?&]q=(-?\d+\.?\d*),(-?\d+\.?\d*)',       # q=lat,lng
     ]
-
     for pattern in patterns:
         match = re.search(pattern, url)
         if match:
-            lat = float(match.group(1))
-            lng = float(match.group(2))
-            # Validate coordinates
-            if -90 <= lat <= 90 and -180 <= lng <= 180:
-                logger.info(f"Coords extracted: lat={lat}, lng={lng}")
-                return lat, lng
-
+            return float(match.group(1)), float(match.group(2))
     return None
 
 async def resolve_shortened_maps_link(url: str) -> Optional[Tuple[float, float]]:
@@ -3145,48 +3126,36 @@ async def geocode_all_places(request: web.Request) -> web.Response:
         logger.error(f"Geocode all error: {e}")
         return web.json_response({"success": False, "error": str(e)}, status=500)
 
-async def resolve_maps_link(request: web.Request) -> web.Response:
-    """Qisqartilgan yoki to'liq Google Maps linkdan koordinatalarni olib olish"""
+async def resolve_maps_link(url: str) -> dict:
+    url = url.strip()  # Bo'shliqlarni olib tashlash (sizning URLda trailing space bor edi!)
+    
+    # 1. To'g'ridan-to'g'ri koordinat bor-yo'qligini tekshirish
+    coords = extract_coords_from_url(url)
+    if coords:
+        return {"lat": coords[0], "lng": coords[1]}
+    
+    # 2. Short URL ni kengaytirish (redirect orqali)
     try:
-        data = await request.json()
-        
-        # Admin autentifikatsiya tekshirish
-        user = await check_admin_auth(data)
-        if not user or not user.get('is_admin'):
-            return web.json_response({"success": False, "error": "Unauthorized"}, status=403)
-        
-        url = data.get('url', '').strip()
-        if not url:
-            return web.json_response({"success": False, "error": "URL required"}, status=400)
-
-        # URL ni to'liq tozalash: bo'sh joylar, tab, yangi qator
-        url = url.strip().rstrip('  \t\n\r')
-        
-        logger.info(f"resolve_maps_link: URL={repr(url)}")
-        
-        # 1. To'g'ridan-to'g'ri URL tahlil
-        coords = extract_coords_from_url(url)
+        expanded_url = await expand_short_url(url)
+        logging.info(f"Expanded URL: {expanded_url}")
+        coords = extract_coords_from_url(expanded_url)
         if coords:
-            logger.info(f"Coords from direct parse: {coords}")
-            return web.json_response({"success": True, "lat": coords[0], "lng": coords[1], "method": "direct"})
-        
-        # 2. Qisqartilgan linkni kengaytirish
-        logger.info(f"Direct parse failed, trying redirect resolve...")
-        coords = await resolve_shortened_maps_link(url)
-        if coords:
-            logger.info(f"Coords from redirect: {coords}")
-            return web.json_response({"success": True, "lat": coords[0], "lng": coords[1], "method": "redirect"})
-        
-        logger.warning(f"All methods failed for URL: {url}")
-        return web.json_response({
-            "success": False, 
-            "error": "Koordinatalar topilmadi. Manzil nomini kiriting yoki koordinatni qo'lda kiriting.",
-            "url": url
-        }, status=400)
-        
+            return {"lat": coords[0], "lng": coords[1]}
     except Exception as e:
-        logger.error(f"resolve_maps_link exception: {type(e).__name__}: {e}")
-        return web.json_response({"success": False, "error": str(e)}, status=500)
+        logging.error(f"Expand failed: {e}")
+    
+    return None
+
+async def expand_short_url(url: str) -> str:
+    """Short URL ni kengaytirish - requests ishlatmasdan aiohttp bilan"""
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            url,
+            allow_redirects=True,
+            timeout=aiohttp.ClientTimeout(total=10),
+            headers={"User-Agent": "Mozilla/5.0"}
+        ) as response:
+            return str(response.url)  # Final URL (redirect dan keyin)
 
 async def debug_db(request: web.Request) -> web.Response:
     try:
@@ -3337,6 +3306,9 @@ async def process_language(callback_query: types.CallbackQuery):
     # Asosiy menyuni tanlangan tilda ko'rsatish
     await show_main_menu(callback_query.message, user_id, lang, is_admin)
 
+
+
+
 async def health_check(request: web.Request) -> web.Response:
     try:
         if db_pool is None:
@@ -3351,6 +3323,23 @@ async def health_check(request: web.Request) -> web.Response:
     except Exception as e:
         return web.json_response({"success": False, "error": str(e)}, status=500)
 
+async def resolve_link_endpoint(request):
+    body = await request.json()
+    url = body.get("url", "").strip()  # .strip() muhim!
+    
+    if not url:
+        return web.json_response({"error": "URL kerak"}, status=400)
+    
+    result = await resolve_maps_link(url)
+    
+    if result:
+        return web.json_response(result)
+    else:
+        return web.json_response(
+            {"error": "Koordinat topilmadi"}, 
+            status=400
+        )
+
 # ------------------- Main -------------------
 async def init_app():
     app = web.Application(middlewares=[cors_middleware])
@@ -3363,7 +3352,7 @@ async def init_app():
     app.router.add_post('/api/places', create_place)
     app.router.add_post('/api/places/{id}/geocode', geocode_place)
     app.router.add_post('/api/admin/geocode-all', geocode_all_places)
-    app.router.add_post('/api/admin/resolve-link', resolve_maps_link)  # LINK KENGAYTIRISH
+    app.router.add_post('/api/admin/resolve-link', resolve_link_endpoint)  # LINK KENGAYTIRISH
     app.router.add_put('/api/places/{id}', update_place)
     app.router.add_delete('/api/places/{id}', delete_place)
     app.router.add_get('/api/debug/db', debug_db)
