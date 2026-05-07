@@ -2627,60 +2627,99 @@ async def resolve_shortened_maps_link(url: str) -> Optional[tuple]:
     """Qisqartilgan Google Maps linkini kengaytirib koordinatalarni olish"""
     if not url:
         return None
-    
+
+    # URL ni tozalash (bo'sh joylar va keraksiz belgilarni olib tashlash)
+    url = url.strip()
+
     # Avval to'liq URL dan koordinatalarni olish
     coords = extract_coords_from_url(url)
     if coords:
         return coords
-    
+
     # Qisqa/Google linklarni kengaytirish
     maps_domains = ['goo.gl', 'maps.app.goo.gl', 'maps.google.com', 'google.com/maps']
     is_maps = any(domain in url.lower() for domain in maps_domains)
-    
+
     if not is_maps:
         return None
-    
+
     try:
         import aiohttp
-        
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'gzip, deflate',
+
+        # Usul 1: HEAD so'rov bilan redirect URL ni olish (eng tez)
+        head_headers = {
+            'User-Agent': 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
         }
-        
-        async with aiohttp.ClientSession(headers=headers) as session:
-            try:
-                # GET so'rov - redirect ni kuzatish
-                async with session.get(
-                    url, 
-                    allow_redirects=True, 
-                    max_redirects=10,
-                    timeout=aiohttp.ClientTimeout(total=20)
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.head(
+                    url,
+                    allow_redirects=True,
+                    max_redirects=15,
+                    timeout=aiohttp.ClientTimeout(total=15),
+                    headers=head_headers,
                 ) as resp:
                     final_url = str(resp.url)
-                    logger.info(f"Final URL after redirect: {final_url}")
-                    
-                    # Final URL dan koordinatalarni olish
+                    logger.info(f"[HEAD] Final URL: {final_url}")
                     coords = extract_coords_from_url(final_url)
                     if coords:
-                        logger.info(f"Coords from final URL: {coords}")
+                        logger.info(f"[HEAD] Coords: {coords}")
                         return coords
-                    
+        except Exception as e:
+            logger.warning(f"[HEAD] Xato: {e}")
+
+        # Usul 2: GET so'rov - redirect ni kuzatish, Location header orqali
+        get_headers = {
+            'User-Agent': 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+        }
+        async with aiohttp.ClientSession(headers=get_headers) as session:
+            # Redirect'siz so'rov - Location header ni o'qish
+            try:
+                async with session.get(
+                    url,
+                    allow_redirects=False,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as resp:
+                    location = resp.headers.get('Location', '')
+                    logger.info(f"[GET no-redirect] Status: {resp.status}, Location: {location}")
+                    if location:
+                        coords = extract_coords_from_url(location)
+                        if coords:
+                            logger.info(f"[Location header] Coords: {coords}")
+                            return coords
+            except Exception as e:
+                logger.warning(f"[GET no-redirect] Xato: {e}")
+
+            # Redirect bilan to'liq so'rov
+            try:
+                async with session.get(
+                    url,
+                    allow_redirects=True,
+                    max_redirects=15,
+                    timeout=aiohttp.ClientTimeout(total=25),
+                ) as resp:
+                    final_url = str(resp.url)
+                    logger.info(f"[GET redirect] Final URL: {final_url}")
+
+                    coords = extract_coords_from_url(final_url)
+                    if coords:
+                        logger.info(f"[GET redirect URL] Coords: {coords}")
+                        return coords
+
                     # HTML content dan qidirish
                     if resp.status == 200:
-                        text = await resp.text()
-                        
-                        # Google Maps JavaScript ichidagi koordinatlar
+                        text = await resp.text(errors='replace')
                         html_patterns = [
                             r'@(-?\d+\.\d+),(-?\d+\.\d+)',
                             r'!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)',
                             r'"lat":(-?\d+\.\d+),"lng":(-?\d+\.\d+)',
                             r'"latitude":(-?\d+\.\d+),"longitude":(-?\d+\.\d+)',
                             r'center=(-?\d+\.\d+),(-?\d+\.\d+)',
-                            r'q=(-?\d+\.\d+),(-?\d+\.\d+)',
+                            r'\[null,null,(-?\d+\.\d+),(-?\d+\.\d+)\]',
                             r'data=.*?!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)',
+                            r'APP_INITIALIZATION_STATE.*?(-?\d{2,3}\.\d{4,}),(-?\d{2,3}\.\d{4,})',
                         ]
                         for pattern in html_patterns:
                             match = re.search(pattern, text)
@@ -2688,18 +2727,18 @@ async def resolve_shortened_maps_link(url: str) -> Optional[tuple]:
                                 lat = float(match.group(1))
                                 lng = float(match.group(2))
                                 if -90 <= lat <= 90 and -180 <= lng <= 180:
-                                    logger.info(f"Coords from HTML ({pattern}): {lat},{lng}")
+                                    logger.info(f"[HTML] Coords ({pattern[:20]}): {lat},{lng}")
                                     return lat, lng
-                        
-                        logger.warning(f"HTML tahlil qilindi lekin koordinat topilmadi. HTML uzunligi: {len(text)}")
+
+                        logger.warning(f"[HTML] Koordinat topilmadi. HTML uzunligi: {len(text)}")
                     else:
-                        logger.warning(f"HTTP status {resp.status} for {url}")
-            except aiohttp.ClientError as e:
-                logger.error(f"HTTP client error for {url}: {e}")
-                
+                        logger.warning(f"[GET] HTTP {resp.status}")
+            except Exception as e:
+                logger.error(f"[GET redirect] Xato: {e}")
+
     except Exception as e:
-        logger.error(f"Resolve shortened link error: {type(e).__name__}: {e}")
-    
+        logger.error(f"resolve_shortened_maps_link: {type(e).__name__}: {e}")
+
     return None
 
 async def geocode_address(address: str) -> Optional[tuple]:
@@ -3153,8 +3192,11 @@ async def resolve_maps_link(request: web.Request) -> web.Response:
         url = data.get('url', '').strip()
         if not url:
             return web.json_response({"success": False, "error": "URL required"}, status=400)
+
+        # URL ni to'liq tozalash: bo'sh joylar, tab, yangi qator
+        url = url.strip().rstrip('  \t\n\r')
         
-        logger.info(f"resolve_maps_link: URL={url}")
+        logger.info(f"resolve_maps_link: URL={repr(url)}")
         
         # 1. To'g'ridan-to'g'ri URL tahlil
         coords = extract_coords_from_url(url)
