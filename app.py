@@ -2593,12 +2593,12 @@ def validate_telegram_data(init_data: str, bot_token: str) -> Optional[dict]:
 def extract_coords_from_url(url: str):
     """URL dan koordinatlarni regex bilan ajratib olish"""
     patterns = [
-        r'@(-?\d+\.?\d*),(-?\d+\.?\d*)',          # @lat,lng
-        r'[?&]ll=(-?\d+\.?\d*),(-?\d+\.?\d*)',     # ll=lat,lng
+        r'@([+-]?\d+\.?\d*),([+-]?\d+\.?\d*)',          # @lat,lng
+        r'[?&]ll=([+-]?\d+\.?\d*),([+-]?\d+\.?\d*)',     # ll=lat,lng
         r'/place/[^/]+/([^/]+)',                     # place format
-        r'!3d(-?\d+\.?\d*)!4d(-?\d+\.?\d*)',        # !3d lat !4d lng
-        r'[?&]q=(-?\d+\.?\d*),(-?\d+\.?\d*)',       # q=lat,lng
-        r'/search/(-?\d+\.?\d*),(-?\d+\.?\d*)',     # /search/lat,lng
+        r'!3d([+-]?\d+\.?\d*)!4d([+-]?\d+\.?\d*)',        # !3d lat !4d lng
+        r'[?&]q=([+-]?\d+\.?\d*),([+-]?\d+\.?\d*)',       # q=lat,lng
+        r'/search/([+-]?\d+\.?\d*),([+-]?\d+\.?\d*)',     # /search/lat,lng
     ]
     for pattern in patterns:
         match = re.search(pattern, url)
