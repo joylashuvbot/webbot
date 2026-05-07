@@ -5,3 +5,4 @@ asyncpg==0.31.0
 python-dotenv==1.2.1
 ujson==5.9.0
 certifi==2024.2.2
+requests==2.31.0
