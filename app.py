@@ -2598,6 +2598,7 @@ def extract_coords_from_url(url: str):
         r'/place/[^/]+/([^/]+)',                     # place format
         r'!3d(-?\d+\.?\d*)!4d(-?\d+\.?\d*)',        # !3d lat !4d lng
         r'[?&]q=(-?\d+\.?\d*),(-?\d+\.?\d*)',       # q=lat,lng
+        r'/search/(-?\d+\.?\d*),(-?\d+\.?\d*)',     # /search/lat,lng
     ]
     for pattern in patterns:
         match = re.search(pattern, url)
